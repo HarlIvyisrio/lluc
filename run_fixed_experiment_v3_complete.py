@@ -782,33 +782,34 @@ def run_mtucb_step(
 
     timestep_results = []
 
-    users = user_subset if user_subset is not None else range(env.num_users)
+    users = list(user_subset) if user_subset is not None else list(range(env.num_users))
+
+    # 使用 Gale–Shapley 稳定匹配，真实体现资源竞争
+    stable_pairs = env.stable_matching(t, users=users) if hasattr(env, 'stable_matching') else [(u, (u + t) % env.num_workers) for u in users]
+    if user_subset is not None:
+        stable_pairs = [(u, w) for (u, w) in stable_pairs if u in user_subset]
 
     worker_load = {w_id: 0 for w_id in range(env.num_workers)}
 
-    
+    for u, assigned_worker in stable_pairs:
 
-    for u in users:
-
-        w = (u + t) % env.num_workers
-
-        safe_w = int(w % env.S.shape[1])
+        safe_w = int(assigned_worker % env.S.shape[1])
 
         path = env.select_path_ucb(t, u, safe_w)
 
-        
+
 
         worker_load[safe_w] += 1
 
         qos_result = env.calculate_enhanced_qos(t, u, safe_w, path, worker_load[safe_w])
 
-        
+
 
         matching_with_paths.append((u, safe_w, path))
 
         timestep_results.append(qos_result if isinstance(qos_result, dict) else {'qos': qos_result})
 
-        
+
 
         if isinstance(qos_result, dict):
 
@@ -832,7 +833,7 @@ def run_mtucb_step(
 
         env.S[u, safe_w, path] += 1
 
-    
+
 
     metrics = env.collect_enhanced_metrics(t, matching_with_paths, timestep_results)
 
@@ -909,27 +910,24 @@ def update_regret_reward_histories(
     histories: Dict[str, List[float]]
 ) -> None:
     """
-    更新遗憾值/奖励序列（即时与累积）
-    
+    更新遗憾值/奖励序列（即时与累积），统一使用"综合 objective_score" 口径。
+
     计算口径说明：
-    - optimal_qos_t: 时隙t的贪心最优总QoS（所有用户之和），来自compute_optimal_qos_for_timestep
-    - actual_qos_t: 时隙t的实际总QoS（avg_qos × num_users）
-    - instant_regret: optimal_qos_t - actual_qos_t（非负，表示与最优的差距）
-    - instant_reward: actual_qos_t（实际获得的总奖励）
-    
-    注意：metrics.avg_qos 必须是原始值，不能被任何multiplier打折，
-    否则regret会人为偏高。（参见run_mtucb_step中的设计说明）
+    - optimal_reward_t: 时隙t的贪心最优总 objective_score（所有用户之和），来自compute_optimal_objective_for_timestep
+    - actual_reward_t: 时隙t的实际总 objective_score（avg_objective_score × num_users）
+    - instant_regret: max(0, optimal_reward_t - actual_reward_t)
+    - instant_reward: actual_reward_t（与算法实时更新 UCB 时的 reward 完全一致）
     """
-    # 获取理论最优总QoS（贪心策略，容量约束下每个用户选最优工人-路径）
-    optimal_qos_t = env.compute_optimal_qos_for_timestep(t)
-    
-    # 计算实际总QoS（平均QoS × 用户数）
-    actual_qos_t = metrics.avg_qos * env.num_users
+    # 获取理论最优总 reward（容量约束下每个用户选 objective_score 最优工人-路径）
+    optimal_reward_t = env.compute_optimal_objective_for_timestep(t)
+
+    # 计算实际总 reward（平均 objective × 用户数）
+    actual_reward_t = metrics.avg_objective_score * env.num_users
 
     # 即时遗憾 = 最优 - 实际（非负值）
-    instant_regret = optimal_qos_t - actual_qos_t
-    # 即时奖励 = 实际获得的总QoS
-    instant_reward = actual_qos_t
+    instant_regret = max(0.0, optimal_reward_t - actual_reward_t)
+    # 即时奖励 = 实际获得的总 reward
+    instant_reward = actual_reward_t
 
     cumulative_regret = (histories['cumulative_regret_history'][-1]
                          if histories['cumulative_regret_history'] else 0.0) + instant_regret
@@ -1344,6 +1342,35 @@ class Method2_LLMInitAsyncBlackbox:
 
         self.baseline_objective = None
 
+    def _build_state_context(self, window_short: int = 10, window_long: int = 30) -> str:
+        """构造包含最近窗口统计量的状态摘要，供LLM参考。"""
+        def summarize(series: List[float], label: str, wnd: int) -> str:
+            if not series:
+                return f"{label}: 无历史数据"
+            arr = np.array(series[-wnd:])
+            p95 = float(np.percentile(arr, 95))
+            trend = "上升" if arr[-1] > arr[0] * 1.05 else ("下降" if arr[-1] < arr[0] * 0.95 else "稳定")
+            return f"{label}: 平均={arr.mean():.4f}, P95={p95:.4f}, 趋势={trend}"
+
+        qos_info = summarize(self.qos_history, "QoS", window_short)
+        latency_info = summarize(self.latency_history_ms, "时延(ms)", window_short)
+        objective_info = summarize(self.objective_score_history, "objective_score", window_long)
+        energy_info = summarize(self.energy_history_joule, "能耗(J)", window_short)
+
+        if self.instant_regret_history:
+            recent_regret = np.array(self.instant_regret_history[-window_long:])
+            regret_trend = "上升" if recent_regret[-1] > recent_regret[0] * 1.05 else ("下降" if recent_regret[-1] < recent_regret[0] * 0.95 else "平稳")
+            regret_info = f"Regret均值={recent_regret.mean():.4f}, 趋势={regret_trend}"
+        else:
+            regret_info = "Regret: 暂无数据"
+
+        weight_info = (
+            f"目标权重: QoS=1.0, 延迟λ={self.lambda_delay:.2f}, 能耗λ={self.lambda_energy:.2f}; "
+            f"归一化参考 d_max={self.d_max_ms:.1f}ms, e_max={self.e_max_joule:.2f}J"
+        )
+
+        return "\n".join([qos_info, latency_info, objective_info, energy_info, regret_info, weight_info])
+
         # 异步评估的协调开销比例
 
         self.async_overlap_factor = 0.3
@@ -1470,6 +1497,8 @@ class Method2_LLMInitAsyncBlackbox:
             
             path_complexity = "简单" if self.env.num_paths <= 3 else ("中等" if self.env.num_paths <= 6 else "复杂")
 
+            state_context = self._build_state_context()
+
             prompt = (
                 f"你是一个网络资源调度优化专家。请为MTUCB算法推荐初始参数。\n\n"
                 f"【网络拓扑】\n"
@@ -1477,19 +1506,24 @@ class Method2_LLMInitAsyncBlackbox:
                 f"- 工人数: {self.env.num_workers}\n"
                 f"- 路径数: {self.env.num_paths}\n"
                 f"- 用户/工人比: {user_worker_ratio:.2f}\n\n"
+                f"【实时状态摘要】\n{state_context}\n\n"
                 f"【负载分析】\n"
                 f"- 负载水平: {load_level}\n"
                 f"- 路径复杂度: {path_complexity}（{self.env.num_paths}条可选路径）\n"
                 f"- 建议方向: {load_advice}\n\n"
                 f"【参数说明】\n"
-                f"1. alpha (0.3-0.9): 路径质量权重，越大越偏向历史表现好的路径\n"
-                f"2. zeta (0.1-0.5): UCB探索强度，越大越倾向尝试未知路径\n"
-                f"3. omega (0.05-0.3): 切换成本权重，越大越倾向保持当前路径\n\n"
+                f"1. alpha (0.3-0.9): 路径质量权重\n"
+                f"2. zeta (0.1-0.5): UCB探索强度\n"
+                f"3. omega (0.05-0.3): 切换成本权重\n"
+                f"4. compression_ratio (0.5-0.95): 语义压缩率\n"
+                f"5. power_ratio (0.3-0.8): 功率分配系数\n"
+                f"6. min_phi (0.4-0.9): 语义速率阈值\n\n"
                 f"【注意事项】\n"
                 f"- 高负载场景下，应优先保证QoS，减少不必要的探索\n"
                 f"- 低负载场景下，可适当探索以发现更优配置\n"
-                f"- 路径复杂时，需要更多探索；路径简单时，可快速收敛\n\n"
-                f"请仅输出严格的JSON对象，格式如：{{\"alpha\":0.7,\"zeta\":0.2,\"omega\":0.1}}"
+                f"- 路径复杂时，需要更多探索；路径简单时，可快速收敛\n"
+                f"- 输出必须严格为JSON，对应字段: alpha,zeta,omega,compression_ratio,power_ratio,min_phi\n"
+                f"示例: {{\"alpha\":0.7,\"zeta\":0.2,\"omega\":0.1,\"compression_ratio\":0.8,\"power_ratio\":0.5,\"min_phi\":0.6}}"
             )
 
             
@@ -1582,10 +1616,16 @@ class Method2_LLMInitAsyncBlackbox:
                 'alpha': float(getattr(self.env.config, 'alpha', 0.6)),
                 'zeta': float(getattr(self.env.config, 'zeta', 0.25)),
                 'omega': float(getattr(self.env.config, 'omega', 0.15)),
+                'compression_ratio': float(getattr(self.env.config, 'compression_ratio', 0.75)),
+                'power_ratio': float(getattr(self.env.config, 'power_ratio', 0.5)),
+                'min_phi': float(getattr(self.env.config, 'min_phi', 0.6)),
             }
             alpha = None
             zeta = None
             omega = None
+            compression_ratio = None
+            power_ratio = None
+            min_phi = None
 
 
 
@@ -1606,6 +1646,12 @@ class Method2_LLMInitAsyncBlackbox:
                     zeta = parsed.get('zeta')
 
                     omega = parsed.get('omega')
+
+                    compression_ratio = parsed.get('compression_ratio')
+
+                    power_ratio = parsed.get('power_ratio')
+
+                    min_phi = parsed.get('min_phi')
 
             except Exception as e:
 
@@ -1645,6 +1691,12 @@ class Method2_LLMInitAsyncBlackbox:
 
                 omega = omega if omega is not None else pick(r"omega\s*[:：=]\s*([0-9]+(?:\.[0-9]+)?)", cleaned)
 
+                compression_ratio = compression_ratio if compression_ratio is not None else pick(r"compression_ratio\s*[:：=]\s*([0-9]+(?:\.[0-9]+)?)", cleaned)
+
+                power_ratio = power_ratio if power_ratio is not None else pick(r"power_ratio\s*[:：=]\s*([0-9]+(?:\.[0-9]+)?)", cleaned)
+
+                min_phi = min_phi if min_phi is not None else pick(r"min_phi\s*[:：=]\s*([0-9]+(?:\.[0-9]+)?)", cleaned)
+
             
 
             # 仍失败则提取文本中前三个0-1之间的小数作为兜底
@@ -1655,7 +1707,13 @@ class Method2_LLMInitAsyncBlackbox:
 
                 nums = [float(x) for x in re.findall(r"([0-1](?:\.[0-9]+)?)", llm_response)]
 
-                if len(nums) >= 3:
+                if len(nums) >= 6:
+
+                    alpha, zeta, omega, compression_ratio, power_ratio, min_phi = nums[:6]
+
+                    log_data['extracted_numbers'] = nums[:6]
+
+                elif len(nums) >= 3:
 
                     alpha, zeta, omega = nums[0], nums[1], nums[2]
 
@@ -1669,10 +1727,20 @@ class Method2_LLMInitAsyncBlackbox:
                     'zeta': np.clip(float(zeta), 0.1, 0.5),
                     'omega': np.clip(float(omega), 0.05, 0.3),
                 }
+                if compression_ratio is not None:
+                    suggestion['compression_ratio'] = np.clip(float(compression_ratio), 0.5, 0.95)
+                if power_ratio is not None:
+                    suggestion['power_ratio'] = np.clip(float(power_ratio), 0.3, 0.8)
+                if min_phi is not None:
+                    suggestion['min_phi'] = np.clip(float(min_phi), 0.4, 0.9)
+
                 blended = blend_params_with_quality(self.llm_model_name, suggestion, default_params, self.llm_quality_history)
                 self.env.config.alpha = blended['alpha']
                 self.env.config.zeta = blended['zeta']
                 self.env.config.omega = blended['omega']
+                self.env.config.compression_ratio = blended.get('compression_ratio', default_params['compression_ratio'])
+                self.env.config.power_ratio = blended.get('power_ratio', default_params['power_ratio'])
+                self.env.config.min_phi = blended.get('min_phi', default_params['min_phi'])
                 self.env.llm_quality_factor = self.llm_quality_history[-1] if self.llm_quality_history else 1.0
 
                 log_data['status'] = 'success'
@@ -1682,6 +1750,9 @@ class Method2_LLMInitAsyncBlackbox:
                 print(f"   alpha: {self.env.config.alpha:.3f}")
                 print(f"   zeta: {self.env.config.zeta:.3f}")
                 print(f"   omega: {self.env.config.omega:.3f}")
+                print(f"   compression_ratio: {self.env.config.compression_ratio:.3f}")
+                print(f"   power_ratio: {self.env.config.power_ratio:.3f}")
+                print(f"   min_phi: {self.env.config.min_phi:.3f}")
 
             else:
                 log_data['status'] = 'parse_failed'
@@ -1692,6 +1763,9 @@ class Method2_LLMInitAsyncBlackbox:
                 self.env.config.alpha = blended['alpha']
                 self.env.config.zeta = blended['zeta']
                 self.env.config.omega = blended['omega']
+                self.env.config.compression_ratio = blended.get('compression_ratio', default_params['compression_ratio'])
+                self.env.config.power_ratio = blended.get('power_ratio', default_params['power_ratio'])
+                self.env.config.min_phi = blended.get('min_phi', default_params['min_phi'])
                 self.env.llm_quality_factor = self.llm_quality_history[-1] if self.llm_quality_history else 1.0
 
         except Exception as e:
@@ -1720,7 +1794,13 @@ class Method2_LLMInitAsyncBlackbox:
 
                 'zeta': float(self.env.config.zeta),
 
-                'omega': float(self.env.config.omega)
+                'omega': float(self.env.config.omega),
+
+                'compression_ratio': float(getattr(self.env.config, 'compression_ratio', default_params['compression_ratio'])),
+
+                'power_ratio': float(getattr(self.env.config, 'power_ratio', default_params['power_ratio'])),
+
+                'min_phi': float(getattr(self.env.config, 'min_phi', default_params['min_phi']))
 
             }
 
@@ -2316,6 +2396,64 @@ class Method3_PeriodicLLMHybrid:
 
 
 
+    def _build_state_context(self, window_short: int = 10, window_long: int = 30) -> str:
+
+        """生成近期状态摘要，让LLM“看到”网络状态与目标权重。"""
+
+        def summarize(series: List[float], label: str, wnd: int) -> str:
+
+            if not series:
+
+                return f"{label}: 无历史数据"
+
+            arr = np.array(series[-wnd:])
+
+            p95 = float(np.percentile(arr, 95))
+
+            trend = "上升" if arr[-1] > arr[0] * 1.05 else ("下降" if arr[-1] < arr[0] * 0.95 else "稳定")
+
+            return f"{label}: 平均={arr.mean():.4f}, P95={p95:.4f}, 趋势={trend}"
+
+
+
+        qos_info = summarize(self.qos_history, "QoS", window_short)
+
+        latency_info = summarize(self.latency_history_ms, "时延(ms)", window_short)
+
+        objective_info = summarize(self.objective_score_history, "objective_score", window_long)
+
+        energy_info = summarize(self.energy_history_joule, "能耗(J)", window_short)
+
+
+
+        if self.instant_regret_history:
+
+            recent_regret = np.array(self.instant_regret_history[-window_long:])
+
+            regret_trend = "上升" if recent_regret[-1] > recent_regret[0] * 1.05 else ("下降" if recent_regret[-1] < recent_regret[0] * 0.95 else "平稳")
+
+            regret_info = f"Regret均值={recent_regret.mean():.4f}, 趋势={regret_trend}"
+
+        else:
+
+            regret_info = "Regret: 暂无数据"
+
+
+
+        weight_info = (
+
+            f"目标权重: QoS=1.0, 延迟λ={self.lambda_delay:.2f}, 能耗λ={self.lambda_energy:.2f}; "
+
+            f"归一化参考 d_max={self.d_max_ms:.1f}ms, e_max={self.e_max_joule:.2f}J"
+
+        )
+
+
+
+        return "\n".join([qos_info, latency_info, objective_info, energy_info, regret_info, weight_info])
+
+
+
     def _apply_params(self, params):
 
         """安全应用参数，兼容dict与dataclass对象。"""
@@ -2385,6 +2523,7 @@ class Method3_PeriodicLLMHybrid:
             avg_qos = current_metrics.get('avg_qos', 0.7)
             avg_latency = current_metrics.get('avg_latency_ms', 150)
             avg_objective = current_metrics.get('avg_objective_score', 0.0)
+            state_context = self._build_state_context()
             
             # 分析QoS趋势（基于历史）
             if len(self.qos_history) >= 10:
@@ -2411,24 +2550,29 @@ class Method3_PeriodicLLMHybrid:
                 action_hint = "维持当前策略或微调"
 
             prompt = (
-                f"你是网络资源调度优化专家。请根据实时监控数据给出参数调整建议。\n\n"
+                f"你是网络资源调度优化专家。请根据实时监控数据给出参数调整建议，并只输出JSON。\n\n"
                 f"【实时监控数据】(时刻 t={t})\n"
                 f"- 平均QoS: {avg_qos:.3f}\n"
                 f"- 平均时延: {avg_latency:.1f}ms\n"
                 f"- 综合目标得分: {avg_objective:.3f}\n"
                 f"- QoS趋势: {qos_trend}\n"
                 f"- 波动性: {volatility_desc}\n"
-                f"- 系统状态: {system_state}\n\n"
+                f"- 系统状态: {system_state}\n"
+                f"- 状态窗口摘要:\n{state_context}\n\n"
                 f"【网络配置】\n"
                 f"- 用户数/工人数/路径数: {self.env.num_users}/{self.env.num_workers}/{self.env.num_paths}\n"
-                f"- 当前参数: α={self.env.config.alpha:.2f}, ζ={self.env.config.zeta:.2f}, ω={self.env.config.omega:.2f}\n\n"
+                f"- 当前参数: α={self.env.config.alpha:.2f}, ζ={self.env.config.zeta:.2f}, ω={self.env.config.omega:.2f}, "
+                f"compression_ratio={self.env.config.compression_ratio:.2f}, power_ratio={self.env.config.power_ratio:.2f}, min_phi={self.env.config.min_phi:.2f}\n\n"
                 f"【建议方向】\n"
                 f"{action_hint}\n\n"
                 f"【参数范围】\n"
                 f"- alpha (0.3-0.9): 路径质量权重\n"
                 f"- zeta (0.1-0.5): UCB探索强度\n"
-                f"- omega (0.05-0.3): 切换成本权重\n\n"
-                f"请仅输出JSON: {{\"alpha\":值,\"zeta\":值,\"omega\":值}}"
+                f"- omega (0.05-0.3): 切换成本权重\n"
+                f"- compression_ratio (0.5-0.95): 语义压缩率\n"
+                f"- power_ratio (0.3-0.8): 功率分配\n"
+                f"- min_phi (0.4-0.9): 语义速率阈值\n\n"
+                f"请仅输出JSON: {{\"alpha\":值,\"zeta\":值,\"omega\":值,\"compression_ratio\":值,\"power_ratio\":值,\"min_phi\":值}}"
             )
 
             
@@ -2441,6 +2585,9 @@ class Method3_PeriodicLLMHybrid:
                 'alpha': float(getattr(self.env.config, 'alpha', 0.6)),
                 'zeta': float(getattr(self.env.config, 'zeta', 0.25)),
                 'omega': float(getattr(self.env.config, 'omega', 0.15)),
+                'compression_ratio': float(getattr(self.env.config, 'compression_ratio', 0.75)),
+                'power_ratio': float(getattr(self.env.config, 'power_ratio', 0.5)),
+                'min_phi': float(getattr(self.env.config, 'min_phi', 0.6)),
             }
 
             for port in ports_to_try:
@@ -2477,7 +2624,7 @@ class Method3_PeriodicLLMHybrid:
 
                         llm_response = result.get('response', '').strip()
 
-                        
+
 
                         # 解析JSON
 
@@ -2490,14 +2637,30 @@ class Method3_PeriodicLLMHybrid:
                                     'zeta': np.clip(float(parsed['zeta']), 0.1, 0.5),
                                     'omega': np.clip(float(parsed['omega']), 0.05, 0.3),
                                 }
+                                if 'compression_ratio' in parsed:
+                                    suggestion['compression_ratio'] = np.clip(float(parsed['compression_ratio']), 0.5, 0.95)
+                                if 'power_ratio' in parsed:
+                                    suggestion['power_ratio'] = np.clip(float(parsed['power_ratio']), 0.3, 0.8)
+                                if 'min_phi' in parsed:
+                                    suggestion['min_phi'] = np.clip(float(parsed['min_phi']), 0.4, 0.9)
                                 self.llm_call_count += 1
-                        except:
+                        except Exception:
                             pass
 
                         if suggestion is None:
                             cleaned = re.sub(r"```[\s\S]*?```|<think>[\s\S]*?", " ", llm_response)
                             nums = [float(x) for x in re.findall(r"([0-1](?:\.[0-9]+)?)", cleaned)]
-                            if len(nums) >= 3:
+                            if len(nums) >= 6:
+                                suggestion = {
+                                    'alpha': np.clip(nums[0], 0.3, 0.9),
+                                    'zeta': np.clip(nums[1], 0.1, 0.5),
+                                    'omega': np.clip(nums[2], 0.05, 0.3),
+                                    'compression_ratio': np.clip(nums[3], 0.5, 0.95),
+                                    'power_ratio': np.clip(nums[4], 0.3, 0.8),
+                                    'min_phi': np.clip(nums[5], 0.4, 0.9),
+                                }
+                                self.llm_call_count += 1
+                            elif len(nums) >= 3:
                                 suggestion = {
                                     'alpha': np.clip(nums[0], 0.3, 0.9),
                                     'zeta': np.clip(nums[1], 0.1, 0.5),
