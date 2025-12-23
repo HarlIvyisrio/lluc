@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from tqdm import tqdm
 
 from Enhanced_MTUCB_with_Ollama import SCQoSConfig
-from run_fixed_experiment_v3_complete import SeededEnvironmentFactory, LatencyModel, run_mtucb_step
+from run_fixed_experiment_v3_complete import SeededEnvironmentFactory, LatencyModel, run_mtucb_step, parse_llm_params
 
 MODELS = ['qwen3:8b', 'phi3:mini', 'deepseek-r1:8b']
 SAMPLES_PER_SCENARIO = 30  # 每种场景30个样本
@@ -126,7 +126,6 @@ def fit_beta_from_stats(mean: float, std: float, max_sum: float = 15.0) -> Tuple
 def call_llm_params(model_name: str, scenario: EvaluationScenario, env) -> Dict[str, float]:
     """调用LLM获取参数建议（使用丰富的语义上下文）"""
     import requests
-    import re
 
     # 计算派生特征
     user_worker_ratio = scenario.num_users / max(1, scenario.num_workers)
@@ -153,8 +152,11 @@ def call_llm_params(model_name: str, scenario: EvaluationScenario, env) -> Dict[
         f"【参数说明】\n"
         f"- alpha (0.3-0.9): 路径质量权重，越大越偏向历史表现好的路径\n"
         f"- zeta (0.1-0.5): UCB探索强度，越大越倾向尝试未知路径\n"
-        f"- omega (0.05-0.3): 切换成本权重，越大越倾向保持当前路径\n\n"
-        f"请仅输出JSON: {{\"alpha\":值, \"zeta\":值, \"omega\":值}}"
+        f"- omega (0.05-0.3): 切换成本权重，越大越倾向保持当前路径\n"
+        f"- compression_ratio (0.5-0.95): 语义压缩率\n"
+        f"- power_ratio (0.3-0.8): 功率分配\n"
+        f"- min_phi (0.4-0.9): 语义速率阈值\n\n"
+        f"请仅输出JSON: {{\"alpha\":值, \"zeta\":值, \"omega\":值, \"compression_ratio\":值, \"power_ratio\":值, \"min_phi\":值}}"
     )
 
     ports = [11434, 11435]
@@ -174,24 +176,9 @@ def call_llm_params(model_name: str, scenario: EvaluationScenario, env) -> Dict[
             if resp.status_code != 200:
                 continue
             raw = resp.json().get('response', '').strip()
-            try:
-                parsed = json.loads(raw)
-                if isinstance(parsed, dict) and all(k in parsed for k in ['alpha', 'zeta', 'omega']):
-                    return {
-                        'alpha': float(np.clip(parsed['alpha'], 0.3, 0.9)),
-                        'zeta': float(np.clip(parsed['zeta'], 0.1, 0.5)),
-                        'omega': float(np.clip(parsed['omega'], 0.05, 0.3)),
-                    }
-            except Exception:
-                pass
-            # fallback: 正则提取数字
-            nums = [float(x) for x in re.findall(r"([0-1](?:\.[0-9]+)?)", raw)]
-            if len(nums) >= 3:
-                return {
-                    'alpha': float(np.clip(nums[0], 0.3, 0.9)),
-                    'zeta': float(np.clip(nums[1], 0.1, 0.5)),
-                    'omega': float(np.clip(nums[2], 0.05, 0.3)),
-                }
+            parsed = parse_llm_params(raw)
+            if parsed:
+                return parsed
         except requests.exceptions.ConnectionError:
             continue
         except Exception:
@@ -203,12 +190,12 @@ def call_llm_params(model_name: str, scenario: EvaluationScenario, env) -> Dict[
 
 
 def simulate_short(env, T: int, lambda_delay: float, lambda_energy: float, d_max: float, e_max: float) -> float:
-    """短窗口仿真，返回平均QoS"""
-    qos_list = []
+    """短窗口仿真，返回平均objective_total"""
+    objective_list = []
     for t in range(T):
         metrics = run_mtucb_step(env, t, lambda_delay, lambda_energy, d_max, e_max)
-        qos_list.append(metrics.avg_qos)
-    return float(np.mean(qos_list)) if qos_list else 0.0
+        objective_list.append(metrics.avg_objective_score * env.num_users)
+    return float(np.mean(objective_list)) if objective_list else 0.0
 
 
 def main():
@@ -251,9 +238,12 @@ def main():
                 env.config.alpha = params.get('alpha', cfg.alpha)
                 env.config.zeta = params.get('zeta', cfg.zeta)
                 env.config.omega = params.get('omega', cfg.omega)
+                env.config.compression_ratio = params.get('compression_ratio', cfg.compression_ratio)
+                env.config.power_ratio = params.get('power_ratio', cfg.power_ratio)
+                env.config.min_phi = params.get('min_phi', cfg.min_phi)
                 
-                avg_qos = simulate_short(env, WINDOW, lambda_delay, lambda_energy, d_max, e_max)
-                scores_by_scenario[scenario.name][model].append(avg_qos)
+                avg_objective_total = simulate_short(env, WINDOW, lambda_delay, lambda_energy, d_max, e_max)
+                scores_by_scenario[scenario.name][model].append(avg_objective_total)
 
     # 计算加权分数
     print("\n" + "=" * 60)
@@ -265,10 +255,10 @@ def main():
         print(f"\n场景 {scenario.name} (权重={scenario.weight:.2f}):")
         for model in MODELS:
             arr = np.array(scores_by_scenario[scenario.name][model])
-            mean_qos = float(np.mean(arr)) if arr.size else 0.0
-            print(f"  {model}: {mean_qos:.4f}")
+            mean_objective_total = float(np.mean(arr)) if arr.size else 0.0
+            print(f"  {model}: {mean_objective_total:.4f}")
             # 加权添加到总分
-            weighted_scores[model].extend([mean_qos * scenario.weight] * len(arr))
+            weighted_scores[model].extend([mean_objective_total * scenario.weight] * len(arr))
 
     # 生成最终质量参数
     print("\n" + "=" * 60)

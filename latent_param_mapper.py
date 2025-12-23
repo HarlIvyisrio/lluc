@@ -143,13 +143,6 @@ class LatentParamMapper:
         power_normalized = (params.power_ratio - self.config.power_bounds[0]) / (
             self.config.power_bounds[1] - self.config.power_bounds[0]
         )
-        
-        compression_normalized = (params.compression_ratio - self.config.compression_bounds[0]) / (
-            self.config.compression_bounds[1] - self.config.compression_bounds[0]
-        )
-        power_normalized = (params.power_ratio - self.config.power_bounds[0]) / (
-            self.config.power_bounds[1] - self.config.power_bounds[0]
-        )
         z4 = inverse_sigmoid(compression_normalized)
         z5 = inverse_sigmoid(power_normalized)
 
@@ -201,7 +194,31 @@ if __name__ == "__main__":
     print(f"默认 z: {default_z}")
     default_params = mapper.latent_to_params(default_z)
     print(f"映射参数: alpha={default_params.alpha:.3f}, zeta={default_params.zeta:.3f}")
-    
+
+    print("\n📋 测试2: 互逆映射一致性")
+    rng = np.random.default_rng(0)
+    for _ in range(50):
+        z = rng.uniform(mapper.config.z_bounds[0], mapper.config.z_bounds[1], size=mapper.config.latent_dim)
+        params = mapper.latent_to_params(z)
+        z_round = mapper.params_to_latent(params)
+        z_clipped = np.clip(z, mapper.config.z_bounds[0], mapper.config.z_bounds[1])
+        assert np.allclose(z_round, z_clipped, atol=1e-5), "互逆映射误差过大"
+
+    print("\n📋 测试3: 参数边界一致性")
+    edge_z_low = np.full(mapper.config.latent_dim, mapper.config.z_bounds[0])
+    edge_z_high = np.full(mapper.config.latent_dim, mapper.config.z_bounds[1])
+    for edge_z in [edge_z_low, edge_z_high]:
+        edge_params = mapper.latent_to_params(edge_z)
+        bounds = mapper.config
+        assert bounds.alpha_bounds[0] <= edge_params.alpha <= bounds.alpha_bounds[1]
+        assert bounds.zeta_bounds[0] <= edge_params.zeta <= bounds.zeta_bounds[1]
+        assert bounds.omega_bounds[0] <= edge_params.omega <= bounds.omega_bounds[1]
+        assert bounds.compression_bounds[0] <= edge_params.compression_ratio <= bounds.compression_bounds[1]
+        assert bounds.power_bounds[0] <= edge_params.power_ratio <= bounds.power_bounds[1]
+        assert bounds.min_phi_bounds[0] <= edge_params.min_phi <= bounds.min_phi_bounds[1]
+        edge_z_round = mapper.params_to_latent(edge_params)
+        assert np.all(edge_z_round <= bounds.z_bounds[1]) and np.all(edge_z_round >= bounds.z_bounds[0])
+
     print("\n✅ Latent Mapper 测试完成！")
 
 
