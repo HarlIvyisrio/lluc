@@ -23,7 +23,7 @@ from sc_qos_optimizer import SCQoSConfig
 @dataclass
 class LatentConfig:
     """Latent 空间配置"""
-    latent_dim: int = 5  # latent 维度
+    latent_dim: int = 6  # latent 维度（压缩率与功率独立）
     param_dim: int = 6   # 参数维度
     
     # 参数边界约束
@@ -46,8 +46,9 @@ class LatentParamMapper:
     - z1 -> alpha: 控制路径质量权重（QoS 核心参数）
     - z2 -> zeta: 控制探索强度（exploration-exploitation tradeoff）
     - z3 -> omega: 控制切换成本（稳定性）
-    - z4 -> compression_ratio, power_ratio: 通过一个 latent 同时影响压缩和功率（资源效率）
-    - z5 -> min_phi: 控制语义速率阈值（服务质量门槛）
+    - z4 -> compression_ratio: 语义压缩率
+    - z5 -> power_ratio: 功率分配系数（与压缩解耦）
+    - z6 -> min_phi: 控制语义速率阈值（服务质量门槛）
     """
     
     def __init__(self, config: Optional[LatentConfig] = None):
@@ -62,9 +63,6 @@ class LatentParamMapper:
         
         def sigmoid(x):
             return 1 / (1 + np.exp(-x))
-        
-        def tanh(x):
-            return np.tanh(x)
         
         # z1 -> alpha
         alpha_normalized = sigmoid(z[0])
@@ -84,25 +82,20 @@ class LatentParamMapper:
             self.config.omega_bounds[1] - self.config.omega_bounds[0]
         )
         
-        # z4 -> compression_ratio 和 power_ratio
-        resource_mode = tanh(z[3])
-        
-        if resource_mode > 0:
-            compression_normalized = 0.5 + 0.5 * resource_mode
-            power_normalized = 0.5 - 0.3 * resource_mode
-        else:
-            compression_normalized = 0.5 + 0.3 * resource_mode
-            power_normalized = 0.5 - 0.5 * resource_mode
-        
+        # z4 -> compression_ratio（独立）
+        compression_normalized = sigmoid(z[3])
         compression_ratio = self.config.compression_bounds[0] + compression_normalized * (
             self.config.compression_bounds[1] - self.config.compression_bounds[0]
         )
+
+        # z5 -> power_ratio（独立）
+        power_normalized = sigmoid(z[4])
         power_ratio = self.config.power_bounds[0] + power_normalized * (
             self.config.power_bounds[1] - self.config.power_bounds[0]
         )
-        
-        # z5 -> min_phi
-        min_phi_normalized = sigmoid(z[4])
+
+        # z6 -> min_phi
+        min_phi_normalized = sigmoid(z[5])
         min_phi = self.config.min_phi_bounds[0] + min_phi_normalized * (
             self.config.min_phi_bounds[1] - self.config.min_phi_bounds[0]
         )
@@ -150,17 +143,15 @@ class LatentParamMapper:
         power_normalized = (params.power_ratio - self.config.power_bounds[0]) / (
             self.config.power_bounds[1] - self.config.power_bounds[0]
         )
-        
-        resource_mode = compression_normalized - power_normalized
-        resource_mode = np.clip(resource_mode, -1, 1)
-        z4 = inverse_tanh(resource_mode)
-        
+        z4 = inverse_sigmoid(compression_normalized)
+        z5 = inverse_sigmoid(power_normalized)
+
         min_phi_normalized = (params.min_phi - self.config.min_phi_bounds[0]) / (
             self.config.min_phi_bounds[1] - self.config.min_phi_bounds[0]
         )
-        z5 = inverse_sigmoid(min_phi_normalized)
-        
-        z = np.array([z1, z2, z3, z4, z5])
+        z6 = inverse_sigmoid(min_phi_normalized)
+
+        z = np.array([z1, z2, z3, z4, z5, z6])
         z = np.clip(z, self.config.z_bounds[0], self.config.z_bounds[1])
         
         return z
@@ -203,7 +194,31 @@ if __name__ == "__main__":
     print(f"默认 z: {default_z}")
     default_params = mapper.latent_to_params(default_z)
     print(f"映射参数: alpha={default_params.alpha:.3f}, zeta={default_params.zeta:.3f}")
-    
+
+    print("\n📋 测试2: 互逆映射一致性")
+    rng = np.random.default_rng(0)
+    for _ in range(50):
+        z = rng.uniform(mapper.config.z_bounds[0], mapper.config.z_bounds[1], size=mapper.config.latent_dim)
+        params = mapper.latent_to_params(z)
+        z_round = mapper.params_to_latent(params)
+        z_clipped = np.clip(z, mapper.config.z_bounds[0], mapper.config.z_bounds[1])
+        assert np.allclose(z_round, z_clipped, atol=1e-5), "互逆映射误差过大"
+
+    print("\n📋 测试3: 参数边界一致性")
+    edge_z_low = np.full(mapper.config.latent_dim, mapper.config.z_bounds[0])
+    edge_z_high = np.full(mapper.config.latent_dim, mapper.config.z_bounds[1])
+    for edge_z in [edge_z_low, edge_z_high]:
+        edge_params = mapper.latent_to_params(edge_z)
+        bounds = mapper.config
+        assert bounds.alpha_bounds[0] <= edge_params.alpha <= bounds.alpha_bounds[1]
+        assert bounds.zeta_bounds[0] <= edge_params.zeta <= bounds.zeta_bounds[1]
+        assert bounds.omega_bounds[0] <= edge_params.omega <= bounds.omega_bounds[1]
+        assert bounds.compression_bounds[0] <= edge_params.compression_ratio <= bounds.compression_bounds[1]
+        assert bounds.power_bounds[0] <= edge_params.power_ratio <= bounds.power_bounds[1]
+        assert bounds.min_phi_bounds[0] <= edge_params.min_phi <= bounds.min_phi_bounds[1]
+        edge_z_round = mapper.params_to_latent(edge_params)
+        assert np.all(edge_z_round <= bounds.z_bounds[1]) and np.all(edge_z_round >= bounds.z_bounds[0])
+
     print("\n✅ Latent Mapper 测试完成！")
 
 

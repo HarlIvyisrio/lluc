@@ -41,7 +41,6 @@ class IncrementalCMAES:
         
         # 设置随机种子
         if seed is not None:
-            np.random.seed(seed)
             self.rng = np.random.RandomState(seed)
         else:
             self.rng = np.random.RandomState()
@@ -334,6 +333,7 @@ class AsyncBlackboxOptimizer:
         """
         self.cmaes.reset(z0)
         self.is_running = True
+        # 使用启动时刻作为评估基准，避免优化期间目标函数随时间漂移
         self.current_t = current_t
         self.start_time = time.time()
         
@@ -358,8 +358,9 @@ class AsyncBlackboxOptimizer:
             # 评估当前批次的候选解
             fitnesses = []
             for x in self.current_population:
-                # 使用当前全局时间进行评估
-                fitness = self.evaluator(x, current_t)
+                # 始终使用启动时刻的环境状态进行评估，避免目标函数随时间漂移
+                eval_t = self.current_t if self.current_t is not None else current_t
+                fitness = self.evaluator(x, eval_t)
                 fitnesses.append(fitness)
             
             self.total_evals += len(self.current_population)
@@ -440,5 +441,4 @@ if __name__ == "__main__":
     print(f"最佳解: {best_x}")
     print(f"最佳适应度: {best_f:.8f}")
     print(f"总迭代数: {cmaes.iteration}")
-
 

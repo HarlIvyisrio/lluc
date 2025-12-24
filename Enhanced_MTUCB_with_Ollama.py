@@ -451,6 +451,45 @@ class EnhancedMTUCBBaseline:
 
         return float(best_total_qos)
 
+    def compute_optimal_objective_for_timestep(self, t: int) -> float:
+        """
+        使用与实时决策一致的综合 objective_score 计算贪心最优上界。
+
+        逻辑与 compute_optimal_qos_for_timestep 一致，但基于 objective_score
+       （即 QoS − delay_penalty − energy_penalty），确保 reward/regret 口径统一。
+        """
+        best_total_objective = 0.0
+        worker_loads = {w: 0 for w in range(self.num_workers)}
+
+        for u in range(self.num_users):
+            best_obj_for_user = float('-inf')
+            best_worker = None
+
+            for w in range(self.num_workers):
+                capacity = max(1, self.worker_capacity_profile[w])
+                if worker_loads[w] >= capacity:
+                    continue
+
+                for p in range(self.num_paths):
+                    qos_val = self.calculate_enhanced_qos(t, u, w, p, worker_loads[w])
+                    if isinstance(qos_val, dict):
+                        obj_scalar = qos_val.get('objective_score')
+                    else:
+                        obj_scalar = None
+
+                    if obj_scalar is None:
+                        continue
+
+                    if obj_scalar > best_obj_for_user:
+                        best_obj_for_user = obj_scalar
+                        best_worker = w
+
+            if best_worker is not None and best_obj_for_user > float('-inf'):
+                worker_loads[best_worker] += 1
+                best_total_objective += best_obj_for_user
+
+        return float(best_total_objective)
+
     def _get_default_metrics(self, t: int) -> EnhancedNetworkMetrics:
         """获取默认指标（当没有匹配时）"""
         return EnhancedNetworkMetrics(
@@ -496,9 +535,9 @@ class EnhancedMTUCBBaseline:
         
         return avg_reward + ucb_term - switching_cost
     
-    def stable_matching(self, t: int) -> List[Tuple[int, int]]:
-        """Gale-Shapley稳定匹配"""
-        free_users = list(range(self.num_users))
+    def stable_matching(self, t: int, users: Optional[List[int]] = None) -> List[Tuple[int, int]]:
+        """Gale-Shapley稳定匹配（可选用户子集）"""
+        free_users = list(users) if users is not None else list(range(self.num_users))
         matches = {w: [] for w in range(self.num_workers)}
         proposals = {u: set() for u in range(self.num_users)}
         

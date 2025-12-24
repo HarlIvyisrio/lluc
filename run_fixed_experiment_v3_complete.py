@@ -117,6 +117,22 @@ LLM_QUALITY_PARAMS_FALLBACK = {
 if 'LLM_QUALITY_PARAMS' not in dir() or not LLM_QUALITY_PARAMS:
     LLM_QUALITY_PARAMS = LLM_QUALITY_PARAMS_FALLBACK
 
+LLM_PARAM_KEYS = [
+    "alpha",
+    "zeta",
+    "omega",
+    "compression_ratio",
+    "power_ratio",
+    "min_phi",
+]
+LLM_PARAM_BOUNDS = {
+    "alpha": (0.3, 0.9),
+    "zeta": (0.1, 0.5),
+    "omega": (0.05, 0.3),
+    "compression_ratio": (0.5, 0.95),
+    "power_ratio": (0.3, 0.8),
+    "min_phi": (0.4, 0.9),
+}
 
 
 
@@ -217,6 +233,48 @@ def blend_params_with_quality(
         # 使用调整后的quality进行混合
         final_params[key] = float(adjusted_quality * llm_val + (1 - adjusted_quality) * base_val)
     return final_params
+
+
+def parse_llm_params(payload: object) -> Optional[Dict[str, float]]:
+    """Parse strict JSON parameters from an LLM payload."""
+    try:
+        if isinstance(payload, dict):
+            parsed = payload
+        else:
+            parsed = json.loads(str(payload))
+    except Exception:
+        return None
+
+    if not isinstance(parsed, dict):
+        return None
+
+    params = {}
+    for key in LLM_PARAM_KEYS:
+        if key not in parsed:
+            return None
+        try:
+            value = float(parsed[key])
+        except (TypeError, ValueError):
+            return None
+        low, high = LLM_PARAM_BOUNDS[key]
+        params[key] = float(np.clip(value, low, high))
+    return params
+
+
+def finalize_step_metrics(
+    env: EnhancedMTUCBBaseline,
+    metrics: EnhancedNetworkMetrics,
+    overhead_ms: float = 0.0,
+) -> Tuple[float, float, float]:
+    """Attach objective/latency totals and overhead to metrics."""
+    objective_total = float(metrics.avg_objective_score) * env.num_users
+    latency_with_overhead = float(metrics.avg_latency_ms) + float(overhead_ms)
+    latency_total = latency_with_overhead * env.num_users
+    setattr(metrics, "objective_total", objective_total)
+    setattr(metrics, "overhead_ms", float(overhead_ms))
+    setattr(metrics, "latency_total", latency_total)
+    setattr(metrics, "latency_with_overhead_ms", latency_with_overhead)
+    return objective_total, latency_with_overhead, latency_total
 
 
 
@@ -633,12 +691,10 @@ class RealSimulationEvaluatorV3:
             
 
             avg_objective = np.mean(objective_window) if objective_window else 0.0
+            objective_total = avg_objective * len(users)
 
-            
-
-            # 返回负的多目标评分（用于最小化）
-
-            return -avg_objective
+            # 返回负的多目标总评分（用于最小化）
+            return -objective_total
 
         finally:
 
@@ -779,60 +835,48 @@ def run_mtucb_step(
     """
 
     matching_with_paths = []
-
     timestep_results = []
+    users = list(user_subset) if user_subset is not None else list(range(env.num_users))
 
-    users = user_subset if user_subset is not None else range(env.num_users)
+    # 使用 Gale–Shapley 稳定匹配，真实体现资源竞争
+    stable_pairs = env.stable_matching(t, users=users) if hasattr(env, 'stable_matching') else [(u, (u + t) % env.num_workers) for u in users]
+    if user_subset is not None:
+        stable_pairs = [(u, w) for (u, w) in stable_pairs if u in user_subset]
 
+    # 先快照所有用户的工人负载，避免按序更新引入偏差
     worker_load = {w_id: 0 for w_id in range(env.num_workers)}
-
-    
-
-    for u in users:
-
-        w = (u + t) % env.num_workers
-
-        safe_w = int(w % env.S.shape[1])
-
-        path = env.select_path_ucb(t, u, safe_w)
-
-        
-
+    for _, assigned_worker in stable_pairs:
+        safe_w = int(assigned_worker % env.S.shape[1])
         worker_load[safe_w] += 1
+
+    pending_updates: List[Tuple[int, int, int, float]] = []
+
+    for u, assigned_worker in stable_pairs:
+        safe_w = int(assigned_worker % env.S.shape[1])
+        path = env.select_path_ucb(t, u, safe_w)
 
         qos_result = env.calculate_enhanced_qos(t, u, safe_w, path, worker_load[safe_w])
 
-        
-
         matching_with_paths.append((u, safe_w, path))
-
         timestep_results.append(qos_result if isinstance(qos_result, dict) else {'qos': qos_result})
 
-        
-
         if isinstance(qos_result, dict):
-
             if 'objective_score' in qos_result:
-
                 objective_score = qos_result['objective_score']
-
             else:
-
                 norm_delay = (qos_result.get('latency', 0.0)) / max(1e-6, d_max_ms)
-
                 norm_energy = (qos_result.get('energy_joule', 0.0)) / max(1e-6, e_max_joule)
-
                 objective_score = qos_result.get('qos', 0.0) - lambda_delay * norm_delay - lambda_energy * norm_energy
-
         else:
-
             objective_score = qos_result
 
-        env.R[u, safe_w, path] += objective_score
+        pending_updates.append((u, safe_w, path, float(objective_score)))
 
+    for u, safe_w, path, objective_score in pending_updates:
+        env.R[u, safe_w, path] += objective_score
         env.S[u, safe_w, path] += 1
 
-    
+
 
     metrics = env.collect_enhanced_metrics(t, matching_with_paths, timestep_results)
 
@@ -909,27 +953,27 @@ def update_regret_reward_histories(
     histories: Dict[str, List[float]]
 ) -> None:
     """
-    更新遗憾值/奖励序列（即时与累积）
-    
+    更新遗憾值/奖励序列（即时与累积），统一使用"综合 objective_score" 口径。
+
     计算口径说明：
-    - optimal_qos_t: 时隙t的贪心最优总QoS（所有用户之和），来自compute_optimal_qos_for_timestep
-    - actual_qos_t: 时隙t的实际总QoS（avg_qos × num_users）
-    - instant_regret: optimal_qos_t - actual_qos_t（非负，表示与最优的差距）
-    - instant_reward: actual_qos_t（实际获得的总奖励）
-    
-    注意：metrics.avg_qos 必须是原始值，不能被任何multiplier打折，
-    否则regret会人为偏高。（参见run_mtucb_step中的设计说明）
+    - optimal_reward_t: 时隙t的贪心最优总 objective_score（所有用户之和），来自compute_optimal_objective_for_timestep
+    - actual_reward_t: 时隙t的实际总 objective_score_total（objective_total）
+    - instant_regret: max(0, optimal_reward_t - actual_reward_t)
+    - instant_reward: actual_reward_t（与算法实时更新 UCB 时的 reward 完全一致）
     """
-    # 获取理论最优总QoS（贪心策略，容量约束下每个用户选最优工人-路径）
-    optimal_qos_t = env.compute_optimal_qos_for_timestep(t)
-    
-    # 计算实际总QoS（平均QoS × 用户数）
-    actual_qos_t = metrics.avg_qos * env.num_users
+    # 获取理论最优总 reward（容量约束下每个用户选 objective_score 最优工人-路径）
+    optimal_reward_t = env.compute_optimal_objective_for_timestep(t)
+
+    # 计算实际总 reward（objective_total）
+    if hasattr(metrics, "objective_total"):
+        actual_reward_t = float(metrics.objective_total)
+    else:
+        actual_reward_t = metrics.avg_objective_score * env.num_users
 
     # 即时遗憾 = 最优 - 实际（非负值）
-    instant_regret = optimal_qos_t - actual_qos_t
-    # 即时奖励 = 实际获得的总QoS
-    instant_reward = actual_qos_t
+    instant_regret = max(0.0, optimal_reward_t - actual_reward_t)
+    # 即时奖励 = 实际获得的总 reward
+    instant_reward = actual_reward_t
 
     cumulative_regret = (histories['cumulative_regret_history'][-1]
                          if histories['cumulative_regret_history'] else 0.0) + instant_regret
@@ -1009,9 +1053,12 @@ class Method1_FixedBaseline:
 
         self.effective_qos_history = []
 
-        self.objective_score_history = []
+        self.objective_total_history = []
+        self.objective_score_history = self.objective_total_history
 
         self.latency_history_ms = []
+        self.latency_total_history = []
+        self.overhead_history_ms = []
 
         self.energy_history_joule = []
 
@@ -1053,14 +1100,19 @@ class Method1_FixedBaseline:
 
             )
 
+            objective_total, latency_with_overhead, latency_total = finalize_step_metrics(
+                self.env,
+                current_metrics,
+                overhead_ms=0.0,
+            )
+
             self.qos_history.append(current_metrics.avg_qos)
-
             self.effective_qos_history.append(current_metrics.avg_effective_qos)
-
-            self.objective_score_history.append(current_metrics.avg_objective_score)
-
+            self.objective_total_history.append(objective_total)
             self.energy_history_joule.append(current_metrics.avg_energy_joule)
-            self.latency_history_ms.append(current_metrics.avg_latency_ms)
+            self.latency_history_ms.append(latency_with_overhead)
+            self.latency_total_history.append(latency_total)
+            self.overhead_history_ms.append(0.0)
             
             
 
@@ -1082,7 +1134,7 @@ class Method1_FixedBaseline:
                 }
             )
 
-            self.latency_tracker.add_timestep(current_metrics.avg_qos, current_metrics.avg_latency_ms)
+            self.latency_tracker.add_timestep(current_metrics.avg_qos, latency_with_overhead)
 
     
 
@@ -1094,7 +1146,7 @@ class Method1_FixedBaseline:
 
         avg_energy = np.mean(self.energy_history_joule) if self.energy_history_joule else 0.0
 
-        avg_objective = np.mean(self.objective_score_history) if self.objective_score_history else 0.0
+        avg_objective_total = np.mean(self.objective_total_history) if self.objective_total_history else 0.0
 
         return {
 
@@ -1105,6 +1157,7 @@ class Method1_FixedBaseline:
             'effective_qos_history': self.effective_qos_history,
 
             'objective_score_history': self.objective_score_history,
+            'objective_total_history': self.objective_total_history,
 
             'latency_history_ms': self.latency_history_ms,
 
@@ -1116,7 +1169,8 @@ class Method1_FixedBaseline:
 
             'avg_effective_qos': self.latency_tracker.get_average_effective_qos(),
 
-            'avg_objective_score': avg_objective,
+            'avg_objective_score': avg_objective_total,
+            'avg_objective_total': avg_objective_total,
 
             'avg_latency_ms': avg_latency_ms,
 
@@ -1125,6 +1179,8 @@ class Method1_FixedBaseline:
             'qos_std': self.latency_tracker.get_qos_std(),
 
             'total_latency_ms': self.latency_tracker.get_total_latency(),
+            'latency_total_history': self.latency_total_history,
+            'overhead_history_ms': self.overhead_history_ms,
 
             'optimization_count': 0,
 
@@ -1322,9 +1378,12 @@ class Method2_LLMInitAsyncBlackbox:
 
         self.effective_qos_history = []
 
-        self.objective_score_history = []
+        self.objective_total_history = []
+        self.objective_score_history = self.objective_total_history
 
         self.latency_history_ms = []
+        self.latency_total_history = []
+        self.overhead_history_ms = []
 
         self.energy_history_joule = []
 
@@ -1343,6 +1402,35 @@ class Method2_LLMInitAsyncBlackbox:
         self.convergence_timestep = -1
 
         self.baseline_objective = None
+
+    def _build_state_context(self, window_short: int = 10, window_long: int = 30) -> str:
+        """构造包含最近窗口统计量的状态摘要，供LLM参考。"""
+        def summarize(series: List[float], label: str, wnd: int) -> str:
+            if not series:
+                return f"{label}: 无历史数据"
+            arr = np.array(series[-wnd:])
+            p95 = float(np.percentile(arr, 95))
+            trend = "上升" if arr[-1] > arr[0] * 1.05 else ("下降" if arr[-1] < arr[0] * 0.95 else "稳定")
+            return f"{label}: 平均={arr.mean():.4f}, P95={p95:.4f}, 趋势={trend}"
+
+        qos_info = summarize(self.qos_history, "QoS", window_short)
+        latency_info = summarize(self.latency_history_ms, "时延(ms)", window_short)
+        objective_info = summarize(self.objective_score_history, "objective_total", window_long)
+        energy_info = summarize(self.energy_history_joule, "能耗(J)", window_short)
+
+        if self.instant_regret_history:
+            recent_regret = np.array(self.instant_regret_history[-window_long:])
+            regret_trend = "上升" if recent_regret[-1] > recent_regret[0] * 1.05 else ("下降" if recent_regret[-1] < recent_regret[0] * 0.95 else "平稳")
+            regret_info = f"Regret均值={recent_regret.mean():.4f}, 趋势={regret_trend}"
+        else:
+            regret_info = "Regret: 暂无数据"
+
+        weight_info = (
+            f"目标权重: QoS=1.0, 延迟λ={self.lambda_delay:.2f}, 能耗λ={self.lambda_energy:.2f}; "
+            f"归一化参考 d_max={self.d_max_ms:.1f}ms, e_max={self.e_max_joule:.2f}J"
+        )
+
+        return "\n".join([qos_info, latency_info, objective_info, energy_info, regret_info, weight_info])
 
         # 异步评估的协调开销比例
 
@@ -1440,18 +1528,20 @@ class Method2_LLMInitAsyncBlackbox:
 
         }
 
-
-
+        default_params = {
+            'alpha': float(getattr(self.env.config, 'alpha', 0.6)),
+            'zeta': float(getattr(self.env.config, 'zeta', 0.25)),
+            'omega': float(getattr(self.env.config, 'omega', 0.15)),
+            'compression_ratio': float(getattr(self.env.config, 'compression_ratio', 0.75)),
+            'power_ratio': float(getattr(self.env.config, 'power_ratio', 0.5)),
+            'min_phi': float(getattr(self.env.config, 'min_phi', 0.6)),
+        }
         latency_ms = None
         start_time = time.time()
 
         try:
 
             import requests
-
-            import json
-
-            import re
 
             
 
@@ -1470,6 +1560,8 @@ class Method2_LLMInitAsyncBlackbox:
             
             path_complexity = "简单" if self.env.num_paths <= 3 else ("中等" if self.env.num_paths <= 6 else "复杂")
 
+            state_context = self._build_state_context()
+
             prompt = (
                 f"你是一个网络资源调度优化专家。请为MTUCB算法推荐初始参数。\n\n"
                 f"【网络拓扑】\n"
@@ -1477,19 +1569,24 @@ class Method2_LLMInitAsyncBlackbox:
                 f"- 工人数: {self.env.num_workers}\n"
                 f"- 路径数: {self.env.num_paths}\n"
                 f"- 用户/工人比: {user_worker_ratio:.2f}\n\n"
+                f"【实时状态摘要】\n{state_context}\n\n"
                 f"【负载分析】\n"
                 f"- 负载水平: {load_level}\n"
                 f"- 路径复杂度: {path_complexity}（{self.env.num_paths}条可选路径）\n"
                 f"- 建议方向: {load_advice}\n\n"
                 f"【参数说明】\n"
-                f"1. alpha (0.3-0.9): 路径质量权重，越大越偏向历史表现好的路径\n"
-                f"2. zeta (0.1-0.5): UCB探索强度，越大越倾向尝试未知路径\n"
-                f"3. omega (0.05-0.3): 切换成本权重，越大越倾向保持当前路径\n\n"
+                f"1. alpha (0.3-0.9): 路径质量权重\n"
+                f"2. zeta (0.1-0.5): UCB探索强度\n"
+                f"3. omega (0.05-0.3): 切换成本权重\n"
+                f"4. compression_ratio (0.5-0.95): 语义压缩率\n"
+                f"5. power_ratio (0.3-0.8): 功率分配系数\n"
+                f"6. min_phi (0.4-0.9): 语义速率阈值\n\n"
                 f"【注意事项】\n"
                 f"- 高负载场景下，应优先保证QoS，减少不必要的探索\n"
                 f"- 低负载场景下，可适当探索以发现更优配置\n"
-                f"- 路径复杂时，需要更多探索；路径简单时，可快速收敛\n\n"
-                f"请仅输出严格的JSON对象，格式如：{{\"alpha\":0.7,\"zeta\":0.2,\"omega\":0.1}}"
+                f"- 路径复杂时，需要更多探索；路径简单时，可快速收敛\n"
+                f"- 输出必须严格为JSON，对应字段: alpha,zeta,omega,compression_ratio,power_ratio,min_phi\n"
+                f"示例: {{\"alpha\":0.7,\"zeta\":0.2,\"omega\":0.1,\"compression_ratio\":0.8,\"power_ratio\":0.5,\"min_phi\":0.6}}"
             )
 
             
@@ -1553,146 +1650,48 @@ class Method2_LLMInitAsyncBlackbox:
             
 
             if response is None or response.status_code != 200:
-
                 log_data['status'] = 'connection_failed'
-
                 log_data['error'] = f'无法连接到Ollama服务（尝试端口: {ports_to_try}）'
-
                 print(f"\n[WARN] LLM调用失败 ({self.llm_model_name}): 无法连接到Ollama服务，使用默认参数")
-
-                latency_ms = self.latency_model.sample_llm_latency()
-                return
-
-
-
-            log_data['used_port'] = used_port
-
-            latency_ms = (time.time() - start_time) * 1000.0
-
-            result = response.json()
-
-            llm_response = result.get('response', '').strip()
-
-            log_data['raw_response'] = llm_response
-
-
-
-            # 初始化占位，避免未赋值引用
-            default_params = {
-                'alpha': float(getattr(self.env.config, 'alpha', 0.6)),
-                'zeta': float(getattr(self.env.config, 'zeta', 0.25)),
-                'omega': float(getattr(self.env.config, 'omega', 0.15)),
-            }
-            alpha = None
-            zeta = None
-            omega = None
-
-
-
-            # 优先尝试严格JSON解析
-
-            parsed = None
-
-            try:
-
-                parsed = json.loads(llm_response)
-
-                log_data['parse_method'] = 'direct_json'
-
-                if isinstance(parsed, dict):
-
-                    alpha = parsed.get('alpha')
-
-                    zeta = parsed.get('zeta')
-
-                    omega = parsed.get('omega')
-
-            except Exception as e:
-
-                log_data['json_parse_error'] = str(e)
-
-                parsed = None
-
-
-
-            # 若仍有缺失，进行容错正则解析
-
-            if any(v is None for v in [alpha, zeta, omega]):
-
-                log_data['parse_method'] = 'regex_fallback'
-
-                # 去除可能的思考标签与代码块标记
-
-                cleaned = re.sub(r"```[\s\S]*?```", " ", llm_response)
-
-                cleaned = re.sub(r"<think>[\s\S]*?", " ", cleaned)  # 去掉<think>后续冗余文本
-
-                log_data['cleaned_response'] = cleaned[:200]
-
-                
-
-                def pick(pattern: str, text: str):
-
-                    m = re.search(pattern, text, flags=re.I)
-
-                    return float(m.group(1)) if m else None
-
-                
-
-                alpha = alpha if alpha is not None else pick(r"alpha\s*[:：=]\s*([0-9]+(?:\.[0-9]+)?)", cleaned)
-
-                zeta  = zeta  if zeta  is not None else pick(r"zeta\s*[:：=]\s*([0-9]+(?:\.[0-9]+)?)", cleaned)
-
-                omega = omega if omega is not None else pick(r"omega\s*[:：=]\s*([0-9]+(?:\.[0-9]+)?)", cleaned)
-
-            
-
-            # 仍失败则提取文本中前三个0-1之间的小数作为兜底
-
-            if any(v is None for v in [alpha, zeta, omega]):
-
-                log_data['parse_method'] = 'number_extraction'
-
-                nums = [float(x) for x in re.findall(r"([0-1](?:\.[0-9]+)?)", llm_response)]
-
-                if len(nums) >= 3:
-
-                    alpha, zeta, omega = nums[0], nums[1], nums[2]
-
-                    log_data['extracted_numbers'] = nums[:3]
-
-                
-
-            if all(v is not None for v in [alpha, zeta, omega]):
-                suggestion = {
-                    'alpha': np.clip(float(alpha), 0.3, 0.9),
-                    'zeta': np.clip(float(zeta), 0.1, 0.5),
-                    'omega': np.clip(float(omega), 0.05, 0.3),
-                }
-                blended = blend_params_with_quality(self.llm_model_name, suggestion, default_params, self.llm_quality_history)
-                self.env.config.alpha = blended['alpha']
-                self.env.config.zeta = blended['zeta']
-                self.env.config.omega = blended['omega']
-                self.env.llm_quality_factor = self.llm_quality_history[-1] if self.llm_quality_history else 1.0
-
-                log_data['status'] = 'success'
-                log_data['params_used'] = blended
-
-                print(f"\n[INFO] LLM初始化成功 ({self.llm_model_name}, 端口:{used_port}):")
-                print(f"   alpha: {self.env.config.alpha:.3f}")
-                print(f"   zeta: {self.env.config.zeta:.3f}")
-                print(f"   omega: {self.env.config.omega:.3f}")
-
+                self.llm_quality_history.append(0.0)
+                self.env.llm_quality_factor = 0.0
             else:
-                log_data['status'] = 'parse_failed'
-                log_data['error'] = '无法从响应中提取参数'
-                print("\n[WARN] LLM响应解析失败，使用默认参数")
-                print(f"   响应内容: {llm_response[:120]}")
-                blended = blend_params_with_quality(self.llm_model_name, {}, default_params, self.llm_quality_history)
-                self.env.config.alpha = blended['alpha']
-                self.env.config.zeta = blended['zeta']
-                self.env.config.omega = blended['omega']
-                self.env.llm_quality_factor = self.llm_quality_history[-1] if self.llm_quality_history else 1.0
+                log_data['used_port'] = used_port
+                latency_ms = (time.time() - start_time) * 1000.0
+                result = response.json()
+                llm_response = result.get('response', '').strip()
+                log_data['raw_response'] = llm_response
+                log_data['parse_method'] = 'strict_json'
+
+                parsed = parse_llm_params(llm_response)
+
+                if parsed:
+                    blended = blend_params_with_quality(self.llm_model_name, parsed, default_params, self.llm_quality_history)
+                    self.env.config.alpha = blended['alpha']
+                    self.env.config.zeta = blended['zeta']
+                    self.env.config.omega = blended['omega']
+                    self.env.config.compression_ratio = blended.get('compression_ratio', default_params['compression_ratio'])
+                    self.env.config.power_ratio = blended.get('power_ratio', default_params['power_ratio'])
+                    self.env.config.min_phi = blended.get('min_phi', default_params['min_phi'])
+                    self.env.llm_quality_factor = self.llm_quality_history[-1] if self.llm_quality_history else 0.0
+
+                    log_data['status'] = 'success'
+                    log_data['params_used'] = blended
+
+                    print(f"\n[INFO] LLM初始化成功 ({self.llm_model_name}, 端口:{used_port}):")
+                    print(f"   alpha: {self.env.config.alpha:.3f}")
+                    print(f"   zeta: {self.env.config.zeta:.3f}")
+                    print(f"   omega: {self.env.config.omega:.3f}")
+                    print(f"   compression_ratio: {self.env.config.compression_ratio:.3f}")
+                    print(f"   power_ratio: {self.env.config.power_ratio:.3f}")
+                    print(f"   min_phi: {self.env.config.min_phi:.3f}")
+                else:
+                    log_data['status'] = 'parse_failed'
+                    log_data['error'] = '无法从响应中提取参数'
+                    print("\n[WARN] LLM响应解析失败，保持默认参数")
+                    print(f"   响应内容: {llm_response[:120]}")
+                    self.llm_quality_history.append(0.0)
+                    self.env.llm_quality_factor = 0.0
 
         except Exception as e:
 
@@ -1700,13 +1699,9 @@ class Method2_LLMInitAsyncBlackbox:
 
             log_data['error'] = str(e)
 
-            print(f"\n[WARN] LLM初始化失败: {e}，使用默认参数")
-            
-            # exception时使用默认参数，llm_quality_factor设为1.0
-            # 表示完全信任默认参数（不受LLM建议质量影响）
-            self.env.llm_quality_factor = 1.0
-            # 也记录到quality_history以保持数据一致性
-            self.llm_quality_history.append(1.0)
+            print(f"\n[WARN] LLM初始化失败: {e}，保持默认参数")
+            self.env.llm_quality_factor = 0.0
+            self.llm_quality_history.append(0.0)
 
         
 
@@ -1720,7 +1715,13 @@ class Method2_LLMInitAsyncBlackbox:
 
                 'zeta': float(self.env.config.zeta),
 
-                'omega': float(self.env.config.omega)
+                'omega': float(self.env.config.omega),
+
+                'compression_ratio': float(getattr(self.env.config, 'compression_ratio', default_params['compression_ratio'])),
+
+                'power_ratio': float(getattr(self.env.config, 'power_ratio', default_params['power_ratio'])),
+
+                'min_phi': float(getattr(self.env.config, 'min_phi', default_params['min_phi']))
 
             }
 
@@ -1797,7 +1798,11 @@ class Method2_LLMInitAsyncBlackbox:
 
             avg_effective_qos_t = current_metrics.avg_effective_qos
 
-            avg_objective_t = current_metrics.avg_objective_score
+            objective_total, _, _ = finalize_step_metrics(
+                self.env,
+                current_metrics,
+                overhead_ms=0.0,
+            )
 
             avg_latency_t = current_metrics.avg_latency_ms
 
@@ -1809,7 +1814,7 @@ class Method2_LLMInitAsyncBlackbox:
 
             self.effective_qos_history.append(avg_effective_qos_t)
 
-            self.objective_score_history.append(avg_objective_t)
+            self.objective_total_history.append(objective_total)
 
             self.energy_history_joule.append(avg_energy_t)
 
@@ -1821,11 +1826,11 @@ class Method2_LLMInitAsyncBlackbox:
 
                 if self.baseline_objective is None:
 
-                    self.baseline_objective = avg_objective_t
+                    self.baseline_objective = objective_total
 
                 else:
 
-                    self.baseline_objective = (self.baseline_objective * t + avg_objective_t) / (t + 1)
+                    self.baseline_objective = (self.baseline_objective * t + objective_total) / (t + 1)
 
             
 
@@ -1833,7 +1838,7 @@ class Method2_LLMInitAsyncBlackbox:
 
             if self.convergence_timestep == -1 and self.baseline_objective is not None:
 
-                if avg_objective_t > self.baseline_objective * 1.1:
+                if objective_total > self.baseline_objective * 1.1:
 
                     self.convergence_timestep = t
 
@@ -1972,11 +1977,21 @@ class Method2_LLMInitAsyncBlackbox:
             # 4. 记录时延
 
             if INCLUDE_OPT_OVERHEAD_IN_LATENCY:
-                latency_with_overhead = avg_latency_t + optimization_latency * self.async_overlap_factor
+                overhead_ms = optimization_latency * self.async_overlap_factor
+                latency_with_overhead = avg_latency_t + overhead_ms
             else:
+                overhead_ms = 0.0
                 latency_with_overhead = avg_latency_t
 
+            _, _, latency_total = finalize_step_metrics(
+                self.env,
+                current_metrics,
+                overhead_ms=overhead_ms,
+            )
+
             self.latency_history_ms.append(latency_with_overhead)
+            self.latency_total_history.append(latency_total)
+            self.overhead_history_ms.append(overhead_ms)
 
             self.latency_tracker.add_timestep(avg_qos_t, latency_with_overhead)
 
@@ -2010,7 +2025,7 @@ class Method2_LLMInitAsyncBlackbox:
 
         avg_energy = np.mean(self.energy_history_joule) if self.energy_history_joule else 0.0
 
-        avg_objective = np.mean(self.objective_score_history) if self.objective_score_history else 0.0
+        avg_objective_total = np.mean(self.objective_total_history) if self.objective_total_history else 0.0
 
         return {
 
@@ -2021,6 +2036,7 @@ class Method2_LLMInitAsyncBlackbox:
             'effective_qos_history': self.effective_qos_history,
 
             'objective_score_history': self.objective_score_history,
+            'objective_total_history': self.objective_total_history,
 
             'latency_history_ms': self.latency_history_ms,
 
@@ -2038,7 +2054,8 @@ class Method2_LLMInitAsyncBlackbox:
 
             'avg_effective_qos': self.latency_tracker.get_average_effective_qos(),
 
-            'avg_objective_score': avg_objective,
+            'avg_objective_score': avg_objective_total,
+            'avg_objective_total': avg_objective_total,
 
             'avg_latency_ms': avg_latency_ms,
 
@@ -2047,6 +2064,8 @@ class Method2_LLMInitAsyncBlackbox:
             'qos_std': self.latency_tracker.get_qos_std(),
 
             'total_latency_ms': self.latency_tracker.get_total_latency(),
+            'latency_total_history': self.latency_total_history,
+            'overhead_history_ms': self.overhead_history_ms,
 
             'optimization_count': self.optimization_count,
 
@@ -2062,9 +2081,7 @@ class Method2_LLMInitAsyncBlackbox:
 
             'cumulative_regret_history': self.cumulative_regret_history,
 
-            'cumulative_reward_history': self.cumulative_reward_history,
-            'llm_quality_history': self.llm_quality_history,
-            'llm_avg_quality': float(np.mean(self.llm_quality_history)) if self.llm_quality_history else 0.0
+            'cumulative_reward_history': self.cumulative_reward_history
 
         }
 
@@ -2267,9 +2284,12 @@ class Method3_PeriodicLLMHybrid:
 
         self.effective_qos_history = []
 
-        self.objective_score_history = []
+        self.objective_total_history = []
+        self.objective_score_history = self.objective_total_history
 
         self.latency_history_ms = []
+        self.latency_total_history = []
+        self.overhead_history_ms = []
 
         self.energy_history_joule = []
 
@@ -2313,6 +2333,64 @@ class Method3_PeriodicLLMHybrid:
         # 异步评估的协调开销占比（评估主要在后台）
 
         self.async_overlap_factor = 0.3
+
+
+
+    def _build_state_context(self, window_short: int = 10, window_long: int = 30) -> str:
+
+        """生成近期状态摘要，让LLM“看到”网络状态与目标权重。"""
+
+        def summarize(series: List[float], label: str, wnd: int) -> str:
+
+            if not series:
+
+                return f"{label}: 无历史数据"
+
+            arr = np.array(series[-wnd:])
+
+            p95 = float(np.percentile(arr, 95))
+
+            trend = "上升" if arr[-1] > arr[0] * 1.05 else ("下降" if arr[-1] < arr[0] * 0.95 else "稳定")
+
+            return f"{label}: 平均={arr.mean():.4f}, P95={p95:.4f}, 趋势={trend}"
+
+
+
+        qos_info = summarize(self.qos_history, "QoS", window_short)
+
+        latency_info = summarize(self.latency_history_ms, "时延(ms)", window_short)
+
+        objective_info = summarize(self.objective_score_history, "objective_total", window_long)
+
+        energy_info = summarize(self.energy_history_joule, "能耗(J)", window_short)
+
+
+
+        if self.instant_regret_history:
+
+            recent_regret = np.array(self.instant_regret_history[-window_long:])
+
+            regret_trend = "上升" if recent_regret[-1] > recent_regret[0] * 1.05 else ("下降" if recent_regret[-1] < recent_regret[0] * 0.95 else "平稳")
+
+            regret_info = f"Regret均值={recent_regret.mean():.4f}, 趋势={regret_trend}"
+
+        else:
+
+            regret_info = "Regret: 暂无数据"
+
+
+
+        weight_info = (
+
+            f"目标权重: QoS=1.0, 延迟λ={self.lambda_delay:.2f}, 能耗λ={self.lambda_energy:.2f}; "
+
+            f"归一化参考 d_max={self.d_max_ms:.1f}ms, e_max={self.e_max_joule:.2f}J"
+
+        )
+
+
+
+        return "\n".join([qos_info, latency_info, objective_info, energy_info, regret_info, weight_info])
 
 
 
@@ -2369,22 +2447,20 @@ class Method3_PeriodicLLMHybrid:
         """
         latency_ms = None
         response = None
+        quality_recorded = False
         start_time = time.time()
 
         try:
 
             import requests
 
-            import json
-
-            import re
-
             
 
             # 构建上下文感知提示（丰富历史信息和趋势分析）
             avg_qos = current_metrics.get('avg_qos', 0.7)
             avg_latency = current_metrics.get('avg_latency_ms', 150)
-            avg_objective = current_metrics.get('avg_objective_score', 0.0)
+            objective_total = current_metrics.get('avg_objective_score', 0.0)
+            state_context = self._build_state_context()
             
             # 分析QoS趋势（基于历史）
             if len(self.qos_history) >= 10:
@@ -2411,24 +2487,29 @@ class Method3_PeriodicLLMHybrid:
                 action_hint = "维持当前策略或微调"
 
             prompt = (
-                f"你是网络资源调度优化专家。请根据实时监控数据给出参数调整建议。\n\n"
+                f"你是网络资源调度优化专家。请根据实时监控数据给出参数调整建议，并只输出JSON。\n\n"
                 f"【实时监控数据】(时刻 t={t})\n"
                 f"- 平均QoS: {avg_qos:.3f}\n"
                 f"- 平均时延: {avg_latency:.1f}ms\n"
-                f"- 综合目标得分: {avg_objective:.3f}\n"
+                f"- 综合目标总分: {objective_total:.3f}\n"
                 f"- QoS趋势: {qos_trend}\n"
                 f"- 波动性: {volatility_desc}\n"
-                f"- 系统状态: {system_state}\n\n"
+                f"- 系统状态: {system_state}\n"
+                f"- 状态窗口摘要:\n{state_context}\n\n"
                 f"【网络配置】\n"
                 f"- 用户数/工人数/路径数: {self.env.num_users}/{self.env.num_workers}/{self.env.num_paths}\n"
-                f"- 当前参数: α={self.env.config.alpha:.2f}, ζ={self.env.config.zeta:.2f}, ω={self.env.config.omega:.2f}\n\n"
+                f"- 当前参数: α={self.env.config.alpha:.2f}, ζ={self.env.config.zeta:.2f}, ω={self.env.config.omega:.2f}, "
+                f"compression_ratio={self.env.config.compression_ratio:.2f}, power_ratio={self.env.config.power_ratio:.2f}, min_phi={self.env.config.min_phi:.2f}\n\n"
                 f"【建议方向】\n"
                 f"{action_hint}\n\n"
                 f"【参数范围】\n"
                 f"- alpha (0.3-0.9): 路径质量权重\n"
                 f"- zeta (0.1-0.5): UCB探索强度\n"
-                f"- omega (0.05-0.3): 切换成本权重\n\n"
-                f"请仅输出JSON: {{\"alpha\":值,\"zeta\":值,\"omega\":值}}"
+                f"- omega (0.05-0.3): 切换成本权重\n"
+                f"- compression_ratio (0.5-0.95): 语义压缩率\n"
+                f"- power_ratio (0.3-0.8): 功率分配\n"
+                f"- min_phi (0.4-0.9): 语义速率阈值\n\n"
+                f"请仅输出JSON: {{\"alpha\":值,\"zeta\":值,\"omega\":值,\"compression_ratio\":值,\"power_ratio\":值,\"min_phi\":值}}"
             )
 
             
@@ -2441,6 +2522,9 @@ class Method3_PeriodicLLMHybrid:
                 'alpha': float(getattr(self.env.config, 'alpha', 0.6)),
                 'zeta': float(getattr(self.env.config, 'zeta', 0.25)),
                 'omega': float(getattr(self.env.config, 'omega', 0.15)),
+                'compression_ratio': float(getattr(self.env.config, 'compression_ratio', 0.75)),
+                'power_ratio': float(getattr(self.env.config, 'power_ratio', 0.5)),
+                'min_phi': float(getattr(self.env.config, 'min_phi', 0.6)),
             }
 
             for port in ports_to_try:
@@ -2477,37 +2561,17 @@ class Method3_PeriodicLLMHybrid:
 
                         llm_response = result.get('response', '').strip()
 
-                        
 
-                        # 解析JSON
 
-                        suggestion = None
-                        try:
-                            parsed = json.loads(llm_response)
-                            if isinstance(parsed, dict) and all(k in parsed for k in ['alpha', 'zeta', 'omega']):
-                                suggestion = {
-                                    'alpha': np.clip(float(parsed['alpha']), 0.3, 0.9),
-                                    'zeta': np.clip(float(parsed['zeta']), 0.1, 0.5),
-                                    'omega': np.clip(float(parsed['omega']), 0.05, 0.3),
-                                }
-                                self.llm_call_count += 1
-                        except:
-                            pass
-
-                        if suggestion is None:
-                            cleaned = re.sub(r"```[\s\S]*?```|<think>[\s\S]*?", " ", llm_response)
-                            nums = [float(x) for x in re.findall(r"([0-1](?:\.[0-9]+)?)", cleaned)]
-                            if len(nums) >= 3:
-                                suggestion = {
-                                    'alpha': np.clip(nums[0], 0.3, 0.9),
-                                    'zeta': np.clip(nums[1], 0.1, 0.5),
-                                    'omega': np.clip(nums[2], 0.05, 0.3),
-                                }
-                                self.llm_call_count += 1
-
+                        suggestion = parse_llm_params(llm_response)
                         if suggestion:
                             blended = blend_params_with_quality(self.llm_model_name, suggestion, default_params, self.llm_quality_history)
+                            self.llm_call_count += 1
+                            quality_recorded = True
                             return blended
+
+                        self.llm_quality_history.append(0.0)
+                        quality_recorded = True
 
                         break
 
@@ -2520,6 +2584,9 @@ class Method3_PeriodicLLMHybrid:
         except Exception as e:
 
             print(f"   [WARN] LLM调用失败 (t={t}): {e}")
+            if not quality_recorded:
+                self.llm_quality_history.append(0.0)
+                quality_recorded = True
 
 
 
@@ -2530,6 +2597,9 @@ class Method3_PeriodicLLMHybrid:
                 except Exception:
                     latency_ms = 0.0
             self.llm_latency_history.append(float(latency_ms))
+
+        if not quality_recorded:
+            self.llm_quality_history.append(0.0)
 
         return None
 
@@ -2575,13 +2645,19 @@ class Method3_PeriodicLLMHybrid:
 
             
 
+            objective_total, _, _ = finalize_step_metrics(
+                self.env,
+                current_metrics,
+                overhead_ms=0.0,
+            )
+
             # 记录当前参数
 
             self.qos_history.append(current_metrics.avg_qos)
 
             self.effective_qos_history.append(current_metrics.avg_effective_qos)
 
-            self.objective_score_history.append(current_metrics.avg_objective_score)
+            self.objective_total_history.append(objective_total)
 
             self.energy_history_joule.append(current_metrics.avg_energy_joule)
 
@@ -2617,7 +2693,7 @@ class Method3_PeriodicLLMHybrid:
 
             if t < 10:
 
-                base_obj = current_metrics.avg_objective_score
+                base_obj = objective_total
 
                 if self.baseline_objective is None:
 
@@ -2639,7 +2715,7 @@ class Method3_PeriodicLLMHybrid:
 
                     'avg_latency_ms': avg_latency_t,
 
-                    'avg_objective_score': current_metrics.avg_objective_score
+                    'avg_objective_score': objective_total
 
                 })
 
@@ -2790,11 +2866,21 @@ class Method3_PeriodicLLMHybrid:
             
 
             if INCLUDE_OPT_OVERHEAD_IN_LATENCY:
-                latency_with_overhead = avg_latency_t + optimization_latency * self.async_overlap_factor
+                overhead_ms = optimization_latency * self.async_overlap_factor
+                latency_with_overhead = avg_latency_t + overhead_ms
             else:
+                overhead_ms = 0.0
                 latency_with_overhead = avg_latency_t
 
+            _, _, latency_total = finalize_step_metrics(
+                self.env,
+                current_metrics,
+                overhead_ms=overhead_ms,
+            )
+
             self.latency_history_ms.append(latency_with_overhead)
+            self.latency_total_history.append(latency_total)
+            self.overhead_history_ms.append(overhead_ms)
 
             self.latency_tracker.add_timestep(avg_qos_t, latency_with_overhead)
 
@@ -2806,7 +2892,7 @@ class Method3_PeriodicLLMHybrid:
 
             if self.convergence_timestep == -1 and self.baseline_objective is not None:
 
-                if current_metrics.avg_objective_score > self.baseline_objective * 1.1:
+                if objective_total > self.baseline_objective * 1.1:
 
                     self.convergence_timestep = t
 
@@ -2829,17 +2915,14 @@ class Method3_PeriodicLLMHybrid:
             return
 
         for field in [
-
             'qos_history',
-
             'effective_qos_history',
-
             'objective_score_history',
-
+            'objective_total_history',
             'latency_history_ms',
-
+            'latency_total_history',
+            'overhead_history_ms',
             'energy_history_joule'
-
         ]:
 
             history = getattr(self, field, None)
@@ -2872,7 +2955,7 @@ class Method3_PeriodicLLMHybrid:
 
         avg_energy = np.mean(self.energy_history_joule) if self.energy_history_joule else 0.0
 
-        avg_objective = np.mean(self.objective_score_history) if self.objective_score_history else 0.0
+        avg_objective_total = np.mean(self.objective_total_history) if self.objective_total_history else 0.0
 
         
 
@@ -2885,6 +2968,7 @@ class Method3_PeriodicLLMHybrid:
             'effective_qos_history': self.effective_qos_history,
 
             'objective_score_history': self.objective_score_history,
+            'objective_total_history': self.objective_total_history,
 
             'latency_history_ms': self.latency_history_ms,
 
@@ -2900,7 +2984,8 @@ class Method3_PeriodicLLMHybrid:
 
             'avg_effective_qos': self.latency_tracker.get_average_effective_qos(),
 
-            'avg_objective_score': avg_objective,
+            'avg_objective_score': avg_objective_total,
+            'avg_objective_total': avg_objective_total,
 
             'avg_latency_ms': avg_latency_ms,
 
@@ -2909,6 +2994,8 @@ class Method3_PeriodicLLMHybrid:
             'qos_std': self.latency_tracker.get_qos_std(),
 
             'total_latency_ms': self.latency_tracker.get_total_latency(),
+            'latency_total_history': self.latency_total_history,
+            'overhead_history_ms': self.overhead_history_ms,
 
             'convergence_timestep': self.convergence_timestep,
 
@@ -3117,9 +3204,12 @@ class Method4_DistributedCollaborative:
 
         self.effective_qos_history = []
 
-        self.objective_score_history = []
+        self.objective_total_history = []
+        self.objective_score_history = self.objective_total_history
 
         self.latency_history_ms = []
+        self.latency_total_history = []
+        self.overhead_history_ms = []
 
         self.energy_history_joule = []
 
@@ -3332,6 +3422,7 @@ class Method4_DistributedCollaborative:
             avg_effective_qos_t = _weighted_avg(lambda m: m.avg_effective_qos)
 
             avg_objective_t = _weighted_avg(lambda m: m.avg_objective_score)
+            objective_total = avg_objective_t * self.env.num_users
 
             avg_latency_t = _weighted_avg(lambda m: m.avg_latency_ms)
 
@@ -3343,7 +3434,7 @@ class Method4_DistributedCollaborative:
 
             self.effective_qos_history.append(avg_effective_qos_t)
 
-            self.objective_score_history.append(avg_objective_t)
+            self.objective_total_history.append(objective_total)
 
             self.energy_history_joule.append(avg_energy_t)
 
@@ -3356,7 +3447,7 @@ class Method4_DistributedCollaborative:
             update_regret_reward_histories(
                 self.env,
                 t,
-                type('M', (), {'avg_qos': avg_qos_t})(),
+                type('M', (), {'objective_total': objective_total})(),
                 {
                     'instant_regret_history': self.instant_regret_history,
                     'instant_reward_history': self.instant_reward_history,
@@ -3371,11 +3462,11 @@ class Method4_DistributedCollaborative:
 
                 if self.baseline_objective is None:
 
-                    self.baseline_objective = avg_objective_t
+                    self.baseline_objective = objective_total
 
                 else:
 
-                    self.baseline_objective = (self.baseline_objective * t + avg_objective_t) / (t + 1)
+                    self.baseline_objective = (self.baseline_objective * t + objective_total) / (t + 1)
 
 
 
@@ -3418,11 +3509,17 @@ class Method4_DistributedCollaborative:
 
 
             if INCLUDE_OPT_OVERHEAD_IN_LATENCY:
-                latency_with_overhead = avg_latency_t + extra_latency
+                overhead_ms = extra_latency
+                latency_with_overhead = avg_latency_t + overhead_ms
             else:
+                overhead_ms = 0.0
                 latency_with_overhead = avg_latency_t
 
+            latency_total = latency_with_overhead * self.env.num_users
+
             self.latency_history_ms.append(latency_with_overhead)
+            self.latency_total_history.append(latency_total)
+            self.overhead_history_ms.append(overhead_ms)
 
             self.latency_tracker.add_timestep(avg_qos_t, latency_with_overhead)
 
@@ -3430,7 +3527,7 @@ class Method4_DistributedCollaborative:
 
             if self.convergence_timestep == -1 and self.baseline_objective is not None:
 
-                if avg_objective_t > self.baseline_objective * 1.1:
+                if objective_total > self.baseline_objective * 1.1:
 
                     self.convergence_timestep = t
 
@@ -3442,7 +3539,7 @@ class Method4_DistributedCollaborative:
 
         avg_energy = np.mean(self.energy_history_joule) if self.energy_history_joule else 0.0
 
-        avg_objective = np.mean(self.objective_score_history) if self.objective_score_history else 0.0
+        avg_objective_total = np.mean(self.objective_total_history) if self.objective_total_history else 0.0
 
 
 
@@ -3455,6 +3552,7 @@ class Method4_DistributedCollaborative:
             'effective_qos_history': self.effective_qos_history,
 
             'objective_score_history': self.objective_score_history,
+            'objective_total_history': self.objective_total_history,
 
             'latency_history_ms': self.latency_history_ms,
 
@@ -3466,7 +3564,8 @@ class Method4_DistributedCollaborative:
 
             'avg_effective_qos': self.latency_tracker.get_average_effective_qos(),
 
-            'avg_objective_score': avg_objective,
+            'avg_objective_score': avg_objective_total,
+            'avg_objective_total': avg_objective_total,
 
             'avg_latency_ms': avg_latency_ms,
 
@@ -3475,6 +3574,8 @@ class Method4_DistributedCollaborative:
             'qos_std': self.latency_tracker.get_qos_std(),
 
             'total_latency_ms': self.latency_tracker.get_total_latency(),
+            'latency_total_history': self.latency_total_history,
+            'overhead_history_ms': self.overhead_history_ms,
 
             'convergence_timestep': self.convergence_timestep,
 
@@ -3554,23 +3655,7 @@ class Method5_DistributedLLM(Method4_DistributedCollaborative):
         )
 
     def _parse_llm_suggestion(self, raw: str) -> Optional[dict]:
-        import json
-        import re
-
-        try:
-            parsed = json.loads(raw)
-            if isinstance(parsed, dict) and any(k in parsed for k in ['alpha', 'zeta', 'omega']):
-                return parsed
-        except Exception:
-            pass
-
-        nums = [float(x) for x in re.findall(r"([0-9]*\\.?[0-9]+)", raw)]
-        if len(nums) >= 6:
-            keys = ['alpha', 'zeta', 'omega', 'compression_ratio', 'power_ratio', 'min_phi']
-            return {k: nums[i] for i, k in enumerate(keys)}
-        if len(nums) >= 3:
-            return {'alpha': nums[0], 'zeta': nums[1], 'omega': nums[2]}
-        return None
+        return parse_llm_params(raw)
 
     def _build_params_from_suggestion(self, suggestion: dict):
         import copy
@@ -3634,6 +3719,7 @@ class Method5_DistributedLLM(Method4_DistributedCollaborative):
         )
 
         ports_to_try = [11434, 11435]
+        success = False
         for port in ports_to_try:
             try:
                 response = requests.post(
@@ -3670,6 +3756,7 @@ class Method5_DistributedLLM(Method4_DistributedCollaborative):
                 agg_latent = self.param_mapper.params_to_latent(params)
                 self.llm_call_count += 1
                 self.llm_latency_history.append(latency_ms)
+                success = True
                 self.llm_guidance_history.append(
                     {"t": t, "raw": raw, "suggestion": suggestion, "blended": blended, "latency_ms": latency_ms, "port": port}
                 )
@@ -3687,6 +3774,8 @@ class Method5_DistributedLLM(Method4_DistributedCollaborative):
             except Exception as exc:
                 self.llm_guidance_history.append({"t": t, "error": str(exc)})
                 break
+        if not success:
+            self.llm_quality_history.append(0.0)
         return None
 
     def _validate_llm_aggregation(self, base_latent: np.ndarray, llm_latent: np.ndarray, t: int) -> dict:
@@ -3758,7 +3847,7 @@ class Method5_DistributedLLM(Method4_DistributedCollaborative):
 
             self.qos_history.append(avg_qos_t)
             self.effective_qos_history.append(avg_effective_qos_t)
-            self.objective_score_history.append(avg_objective_t)
+            self.objective_total_history.append(objective_total)
             self.energy_history_joule.append(avg_energy_t)
             self.parameter_history['alpha'].append(float(self.env.config.alpha))
             self.parameter_history['zeta'].append(float(self.env.config.zeta))
@@ -3767,7 +3856,7 @@ class Method5_DistributedLLM(Method4_DistributedCollaborative):
             update_regret_reward_histories(
                 self.env,
                 t,
-                type('M', (), {'avg_qos': avg_qos_t})(),
+                type('M', (), {'objective_total': objective_total})(),
                 {
                     'instant_regret_history': self.instant_regret_history,
                     'instant_reward_history': self.instant_reward_history,
@@ -3779,9 +3868,9 @@ class Method5_DistributedLLM(Method4_DistributedCollaborative):
             extra_latency = 0.0
             if t < 10:
                 if self.baseline_objective is None:
-                    self.baseline_objective = avg_objective_t
+                    self.baseline_objective = objective_total
                 else:
-                    self.baseline_objective = (self.baseline_objective * t + avg_objective_t) / (t + 1)
+                    self.baseline_objective = (self.baseline_objective * t + objective_total) / (t + 1)
 
             if t > 0 and t % self.aggregation_period == 0:
                 for node_idx in range(self.num_workers):
@@ -3821,12 +3910,21 @@ class Method5_DistributedLLM(Method4_DistributedCollaborative):
                     f"(source={agg_bundle.get('source', 'weighted')})"
                 )
 
-            latency_with_overhead = avg_latency_t + extra_latency if INCLUDE_OPT_OVERHEAD_IN_LATENCY else avg_latency_t
+            if INCLUDE_OPT_OVERHEAD_IN_LATENCY:
+                overhead_ms = extra_latency
+                latency_with_overhead = avg_latency_t + overhead_ms
+            else:
+                overhead_ms = 0.0
+                latency_with_overhead = avg_latency_t
+
+            latency_total = latency_with_overhead * self.env.num_users
             self.latency_history_ms.append(latency_with_overhead)
+            self.latency_total_history.append(latency_total)
+            self.overhead_history_ms.append(overhead_ms)
             self.latency_tracker.add_timestep(avg_qos_t, latency_with_overhead)
 
             if self.convergence_timestep == -1 and self.baseline_objective is not None:
-                if avg_objective_t > self.baseline_objective * 1.1:
+                if objective_total > self.baseline_objective * 1.1:
                     self.convergence_timestep = t
 
     def get_results(self) -> dict:
@@ -4014,7 +4112,7 @@ def save_comparison_plots(all_results: Dict[str, List[dict]], save_dir: str = 'f
         ('latency_history_ms', 'Average latency (ms)', 'latency_timeseries.png'),
         ('energy_history_joule', 'Average energy (J)', 'energy_timeseries.png'),
         ('qos_history', 'QoS', 'qos_timeseries.png'),
-        ('objective_score_history', 'Objective score', 'objective_score_timeseries.png'),
+        ('objective_score_history', 'Objective total', 'objective_total_timeseries.png'),
         ('cumulative_regret_history', 'Cumulative regret', 'cumulative_regret_timeseries.png'),
         ('cumulative_reward_history', 'Cumulative reward', 'cumulative_reward_timeseries.png'),
     ]
@@ -4450,7 +4548,7 @@ def run_complete_experiment_with_statistics(config: ExperimentConfig):
     def build_stats(results_list):
         avg_qos_list = [r['avg_qos'] for r in results_list]
         avg_effective_qos_list = [r['avg_effective_qos'] for r in results_list]
-        avg_objective_list = [r.get('avg_objective_score', r['avg_qos']) for r in results_list]
+        avg_objective_list = [r.get('avg_objective_total', r.get('avg_objective_score', r['avg_qos'])) for r in results_list]
         avg_latency_list = [r.get('avg_latency_ms', 0.0) for r in results_list]
         avg_energy_list = [r.get('avg_energy_joule', 0.0) for r in results_list]
         qos_std_list = [r['qos_std'] for r in results_list]
@@ -4475,7 +4573,7 @@ def run_complete_experiment_with_statistics(config: ExperimentConfig):
             'method_name': method_name,
             'avg_qos': {'mean': qos_mean, 'std': qos_std, 'ci': qos_ci},
             'avg_effective_qos': {'mean': eff_qos_mean, 'std': eff_qos_std, 'ci': eff_qos_ci},
-            'avg_objective_score': {'mean': obj_mean, 'std': obj_std, 'ci': obj_ci},
+            'avg_objective_total': {'mean': obj_mean, 'std': obj_std, 'ci': obj_ci},
             'qos_jitter': {'mean': jitter_mean, 'std': jitter_std, 'ci': jitter_ci},
             'total_latency_ms': {'mean': latency_mean, 'std': latency_std, 'ci': latency_ci},
             'avg_latency_ms': {'mean': avg_latency_mean, 'std': avg_latency_std, 'ci': avg_latency_ci},
@@ -4553,7 +4651,7 @@ def run_complete_experiment_with_statistics(config: ExperimentConfig):
         if key in ['ttest', 'llm_models']:
             continue
         name = mstats['method_name']
-        obj_str = f"{mstats['avg_objective_score']['mean']:.4f} ± {mstats['avg_objective_score']['ci']:.4f}"
+        obj_str = f"{mstats['avg_objective_total']['mean']:.4f} ± {mstats['avg_objective_total']['ci']:.4f}"
         avg_lat_str = f"{mstats['avg_latency_ms']['mean']:.1f} ± {mstats['avg_latency_ms']['ci']:.1f}"
         avg_energy_str = f"{mstats['avg_energy_joule']['mean']:.3f} ± {mstats['avg_energy_joule']['ci']:.3f}"
         regret_str = f"{mstats['final_cumulative_regret']['mean']:.2f}"
