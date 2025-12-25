@@ -26,10 +26,6 @@ from llm_suggest import NetworkMetrics, LLMSuggestion
 from sc_qos_optimizer import SCQoSOptimizer, SCQoSConfig
 from llm_qos_evaluator import LLMQoSEvaluator
 
-# 设置随机种子
-np.random.seed(42)
-random.seed(42)
-
 # 设置matplotlib支持中文
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial Unicode MS', 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False

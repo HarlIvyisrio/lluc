@@ -7,10 +7,6 @@ from tqdm import tqdm
 from scipy.ndimage import gaussian_filter1d
 from matplotlib.colors import ListedColormap
 
-# 设置随机种子以保证结果可重复
-np.random.seed(42)
-random.seed(42)
-
 # 设置matplotlib支持中文
 plt.rcParams['font.sans-serif'] = ['SimHei']
 plt.rcParams['axes.unicode_minus'] = False
