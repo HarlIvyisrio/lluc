@@ -4555,6 +4555,11 @@ def run_complete_experiment_with_statistics(config: ExperimentConfig):
         total_latency_list = [r['total_latency_ms'] for r in results_list]
         convergence_list = [r['convergence_timestep'] for r in results_list if r.get('convergence_timestep', -1) > 0]
         final_regret_list = [r['cumulative_regret_history'][-1] for r in results_list if r.get('cumulative_regret_history')]
+        final_utility_regret_list = [
+            r['cumulative_utility_regret_history'][-1]
+            for r in results_list
+            if r.get('cumulative_utility_regret_history')
+        ]
         final_reward_list = [r['cumulative_reward_history'][-1] for r in results_list if r.get('cumulative_reward_history')]
 
         qos_mean, qos_std, qos_ci = calc_stats(avg_qos_list)
@@ -4565,6 +4570,7 @@ def run_complete_experiment_with_statistics(config: ExperimentConfig):
         avg_latency_mean, avg_latency_std, avg_latency_ci = calc_stats(avg_latency_list)
         avg_energy_mean, avg_energy_std, avg_energy_ci = calc_stats(avg_energy_list)
         regret_mean, regret_std, regret_ci = calc_stats(final_regret_list) if final_regret_list else (0.0, 0.0, 0.0)
+        utility_regret_mean, utility_regret_std, utility_regret_ci = calc_stats(final_utility_regret_list) if final_utility_regret_list else (0.0, 0.0, 0.0)
         reward_mean, reward_std, reward_ci = calc_stats(final_reward_list) if final_reward_list else (0.0, 0.0, 0.0)
         conv_mean, conv_std, conv_ci = (np.mean(convergence_list), np.std(convergence_list), 0) if convergence_list else (-1, 0, 0)
 
@@ -4579,6 +4585,7 @@ def run_complete_experiment_with_statistics(config: ExperimentConfig):
             'avg_latency_ms': {'mean': avg_latency_mean, 'std': avg_latency_std, 'ci': avg_latency_ci},
             'avg_energy_joule': {'mean': avg_energy_mean, 'std': avg_energy_std, 'ci': avg_energy_ci},
             'final_cumulative_regret': {'mean': regret_mean, 'std': regret_std, 'ci': regret_ci},
+            'final_cumulative_utility_regret': {'mean': utility_regret_mean, 'std': utility_regret_std, 'ci': utility_regret_ci},
             'final_cumulative_reward': {'mean': reward_mean, 'std': reward_std, 'ci': reward_ci},
             'convergence_timestep': {'mean': conv_mean, 'std': conv_std},
             'raw_results': results_list
