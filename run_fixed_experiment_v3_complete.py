@@ -4063,6 +4063,18 @@ def estimate_normalizers(env_factory: SeededEnvironmentFactory, initial_params: 
 
                 energy_samples.append(qos_result.get('energy_joule', 0.0))
 
+                if 'objective_score' in qos_result:
+                    objective_score = qos_result['objective_score']
+                else:
+                    norm_delay = qos_result.get('latency', 0.0) / max(1e-6, env.reference_latency_ms)
+                    norm_energy = qos_result.get('energy_joule', 0.0) / max(1e-6, env.reference_energy)
+                    objective_score = qos_result.get('qos', 0.0) - lambda_delay * norm_delay - lambda_energy * norm_energy
+            else:
+                objective_score = qos_result
+
+            env.R[u, safe_w, path] += float(objective_score)
+            env.S[u, safe_w, path] += 1
+
     d_max = float(np.percentile(lat_samples, 95)) if lat_samples else 500.0
 
     e_max = float(np.percentile(energy_samples, 95)) if energy_samples else 1.0
