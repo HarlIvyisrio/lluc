@@ -114,6 +114,9 @@ class LatentParamMapper:
     
     def params_to_latent(self, params: SCQoSConfig) -> np.ndarray:
         """将 MTUCB 参数反向映射到 latent vector"""
+        if isinstance(params, dict):
+            params = SCQoSConfig(**params)
+
         def inverse_sigmoid(y):
             y = np.clip(y, 1e-7, 1 - 1e-7)
             return np.log(y / (1 - y))
