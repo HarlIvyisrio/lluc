@@ -28,22 +28,25 @@ class IncrementalCMAES:
     避免阻塞整个仿真流程
     """
     
-    def __init__(self, config: CMAESConfig, seed: Optional[int] = None):
+    def __init__(self, config: CMAESConfig, seed: Optional[int] = None, rng: Optional[np.random.Generator] = None):
         """
         初始化CMA-ES优化器
-        
+
         Args:
             config: CMA-ES配置
             seed: 随机种子（确保可复现性）
+            rng: 可选的外部随机数生成器（优先使用），避免在模块导入时影响全局随机状态
         """
         self.config = config
         self.dim = config.dim
-        
-        # 设置随机种子
-        if seed is not None:
-            self.rng = np.random.RandomState(seed)
+
+        # 设置随机生成器（仅在受控上下文中显式播种）
+        if rng is not None:
+            self.rng = rng
+        elif seed is not None:
+            self.rng = np.random.default_rng(seed)
         else:
-            self.rng = np.random.RandomState()
+            self.rng = np.random.default_rng()
         
         # 种群大小
         if config.population_size is None:
@@ -82,7 +85,7 @@ class IncrementalCMAES:
         if x0 is not None:
             self.xmean = x0.copy()
         else:
-            self.xmean = self.rng.randn(self.dim)
+            self.xmean = self.rng.standard_normal(self.dim)
         
         # 步长
         self.sigma = self.config.sigma0
@@ -126,7 +129,7 @@ class IncrementalCMAES:
         self.current_population = []
         for _ in range(self.lambda_):
             # 采样标准正态分布
-            z = self.rng.randn(self.dim)
+            z = self.rng.standard_normal(self.dim)
             # 转换到搜索空间
             y = self.B @ (self.D * z)
             x = self.xmean + self.sigma * y
