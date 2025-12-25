@@ -280,7 +280,13 @@ class EnhancedMTUCBBaseline:
             bandwidth_mbps=float(path_info.get('bandwidth', 0.0)),
             latency_ms=float(latency_ms),
         )
-        combined_qos = self.qos_weight * enhanced_qos + self.semantic_weight * semantic_score
+        semantic_weight = np.clip(
+            self.semantic_weight * float(self.llm_quality_factor),
+            0.05,
+            0.6,
+        )
+        qos_weight = 1.0 - semantic_weight
+        combined_qos = qos_weight * enhanced_qos + semantic_weight * semantic_score
 
         effective_qos = combined_qos * np.exp(-latency_ms / max(1.0, self.reference_latency_ms))
 
