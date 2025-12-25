@@ -490,6 +490,53 @@ class EnhancedMTUCBBaseline:
 
         return float(best_total_objective)
 
+    def compute_optimal_utility_for_timestep(self, t: int) -> float:
+        """在容量约束下计算时隙 t 的贪心最优系统效用。"""
+        best_total_utility = 0.0
+        worker_loads = {w: 0 for w in range(self.num_workers)}
+
+        for u in range(self.num_users):
+            best_utility_for_user = float('-inf')
+            best_worker = None
+            best_path = None
+
+            for w in range(self.num_workers):
+                capacity = max(1, self.worker_capacity_profile[w])
+                if worker_loads[w] >= capacity:
+                    continue
+
+                for p in range(self.num_paths):
+                    qos_result = self.calculate_enhanced_qos(t, u, w, p, worker_loads[w])
+                    if not isinstance(qos_result, dict):
+                        continue
+
+                    qos_value = qos_result.get('qos')
+                    latency_ms = qos_result.get('latency')
+                    energy_joule = qos_result.get('energy_joule')
+
+                    if qos_value is None or latency_ms is None or energy_joule is None:
+                        continue
+
+                    norm_delay = latency_ms / max(1.0, self.reference_latency_ms)
+                    norm_energy = energy_joule / (self.reference_energy + 1e-6)
+
+                    utility = (
+                        self.objective_weights['qos'] * qos_value
+                        - self.objective_weights['delay'] * norm_delay
+                        - self.objective_weights['energy'] * norm_energy
+                    )
+
+                    if utility > best_utility_for_user:
+                        best_utility_for_user = utility
+                        best_worker = w
+                        best_path = p
+
+            if best_worker is not None and best_path is not None and best_utility_for_user > float('-inf'):
+                worker_loads[best_worker] += 1
+                best_total_utility += best_utility_for_user
+
+        return float(best_total_utility)
+
     def _get_default_metrics(self, t: int) -> EnhancedNetworkMetrics:
         """获取默认指标（当没有匹配时）"""
         return EnhancedNetworkMetrics(
