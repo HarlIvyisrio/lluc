@@ -3934,8 +3934,13 @@ class Method5_DistributedLLM(Method4_DistributedCollaborative):
         base['llm_call_count'] = self.llm_call_count
         base['llm_latency_ms'] = self.llm_latency_history
         base['llm_guidance_history'] = self.llm_guidance_history
-        base['llm_quality_history'] = self.llm_quality_history
-        base['llm_avg_quality'] = float(np.mean(self.llm_quality_history)) if self.llm_quality_history else 0.0
+        # 避免重复写入同名字段
+        if 'llm_quality_history' not in base:
+            base['llm_quality_history'] = self.llm_quality_history
+        if 'llm_avg_quality' not in base:
+            base['llm_avg_quality'] = (
+                float(np.mean(self.llm_quality_history)) if self.llm_quality_history else 0.0
+            )
         return base
 
 
