@@ -235,6 +235,24 @@ def blend_params_with_quality(
     return final_params
 
 
+def apply_params_to_env(env, params):
+    """安全应用参数到环境配置，兼容dict与带属性对象。"""
+
+    config = getattr(env, "config", None)
+    if config is None:
+        raise AttributeError("env has no config attribute to apply parameters")
+
+    if isinstance(params, dict):
+        for key in LLM_PARAM_KEYS:
+            if key in params and hasattr(config, key):
+                setattr(config, key, float(params[key]))
+        return
+
+    for key in LLM_PARAM_KEYS:
+        if hasattr(params, key) and hasattr(config, key):
+            setattr(config, key, float(getattr(params, key)))
+
+
 def parse_llm_params(payload: object) -> Optional[Dict[str, float]]:
     """Parse strict JSON parameters from an LLM payload."""
     try:
@@ -1444,42 +1462,6 @@ class Method2_LLMInitAsyncBlackbox:
 
 
 
-    def _apply_params(self, params):
-
-        """安全应用参数，兼容dict与dataclass对象。"""
-
-        try:
-
-            # dataclass/object 直接赋值
-
-            _ = params.alpha
-
-            # 逐字段写入，避免替换引用
-
-            for k in ['alpha', 'zeta', 'omega', 'compression_ratio', 'power_ratio', 'min_phi']:
-
-                if hasattr(params, k) and hasattr(self.env.config, k):
-
-                    setattr(self.env.config, k, float(getattr(params, k)))
-
-        except AttributeError:
-
-            # dict 写入现有配置
-
-            if isinstance(params, dict):
-
-                for k in ['alpha', 'zeta', 'omega', 'compression_ratio', 'power_ratio', 'min_phi']:
-
-                    if k in params:
-
-                        setattr(self.env.config, k, float(params[k]))
-
-            else:
-
-                raise
-
-    
-
     def _llm_initialize_params(self):
 
         """
@@ -1910,7 +1892,7 @@ class Method2_LLMInitAsyncBlackbox:
 
                     # 应用最佳参数（兼容dict/dataclass）
 
-                    self._apply_params(best_params)
+                    apply_params_to_env(self.env, best_params)
 
                     
 
@@ -2394,35 +2376,6 @@ class Method3_PeriodicLLMHybrid:
 
 
 
-    def _apply_params(self, params):
-
-        """安全应用参数，兼容dict与dataclass对象。"""
-
-        try:
-
-            _ = params.alpha
-
-            for k in ['alpha', 'zeta', 'omega', 'compression_ratio', 'power_ratio', 'min_phi']:
-
-                if hasattr(params, k) and hasattr(self.env.config, k):
-
-                    setattr(self.env.config, k, float(getattr(params, k)))
-
-        except AttributeError:
-
-            if isinstance(params, dict):
-
-                for k in ['alpha', 'zeta', 'omega', 'compression_ratio', 'power_ratio', 'min_phi']:
-
-                    if k in params:
-
-                        setattr(self.env.config, k, float(params[k]))
-
-            else:
-
-                raise
-
-    
 
     def _call_llm_for_guidance(self, t: int, current_metrics: dict) -> Optional[dict]:
 
@@ -2849,7 +2802,7 @@ class Method3_PeriodicLLMHybrid:
 
                     # 统一的安全写入
 
-                    self._apply_params(best_params)
+                    apply_params_to_env(self.env, best_params)
 
                     print(f"   [t={t}] 黑盒微调完成: α={self.env.config.alpha:.3f}, ζ={self.env.config.zeta:.3f}, ω={self.env.config.omega:.3f}")
 
