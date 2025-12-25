@@ -716,7 +716,7 @@ class EnhancedMTUCBWithOllama(EnhancedMTUCBBaseline):
                 matching_with_paths.append((u, w, path))
                 qos_results.append(qos_result)
                 
-                self.R[u, w, path] += qos_result['qos']
+                self.R[u, w, path] += qos_result['objective_score']
                 self.S[u, w, path] += 1
                 
                 self.historical_matches[u].append((t, w))
