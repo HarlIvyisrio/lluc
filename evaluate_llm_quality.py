@@ -190,12 +190,18 @@ def call_llm_params(model_name: str, scenario: EvaluationScenario, env) -> Dict[
 
 
 def simulate_short(env, T: int, lambda_delay: float, lambda_energy: float, d_max: float, e_max: float) -> float:
-    """短窗口仿真，返回平均objective_total"""
-    objective_list = []
+    """短窗口仿真，累积归一化效用并返回平均值"""
+    utilities: List[float] = []
     for t in range(T):
         metrics = run_mtucb_step(env, t, lambda_delay, lambda_energy, d_max, e_max)
-        objective_list.append(metrics.avg_objective_score * env.num_users)
-    return float(np.mean(objective_list)) if objective_list else 0.0
+
+        norm_delay = metrics.avg_latency_ms / max(1e-6, d_max)
+        norm_energy = metrics.avg_energy_joule / max(1e-6, e_max)
+        utility = metrics.avg_qos - lambda_delay * norm_delay - lambda_energy * norm_energy
+
+        utilities.append(float(utility))
+
+    return float(np.mean(utilities)) if utilities else 0.0
 
 
 def main():
