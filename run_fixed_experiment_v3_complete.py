@@ -950,7 +950,11 @@ def update_regret_reward_histories(
     env: EnhancedMTUCBBaseline,
     t: int,
     metrics: EnhancedNetworkMetrics,
-    histories: Dict[str, List[float]]
+    histories: Dict[str, List[float]],
+    lambda_delay: float,
+    lambda_energy: float,
+    d_max_ms: float,
+    e_max_joule: float,
 ) -> None:
     """
     更新遗憾值/奖励序列（即时与累积），统一使用"综合 objective_score" 口径。
@@ -964,26 +968,56 @@ def update_regret_reward_histories(
     # 获取理论最优总 reward（容量约束下每个用户选 objective_score 最优工人-路径）
     optimal_reward_t = env.compute_optimal_objective_for_timestep(t)
 
+    optimal_utility_t = env.compute_optimal_utility_for_timestep(
+        t,
+        lambda_delay=lambda_delay,
+        lambda_energy=lambda_energy,
+        d_max_ms=d_max_ms,
+        e_max_joule=e_max_joule,
+    )
+
     # 计算实际总 reward（objective_total）
     if hasattr(metrics, "objective_total"):
         actual_reward_t = float(metrics.objective_total)
     else:
         actual_reward_t = metrics.avg_objective_score * env.num_users
 
+    actual_utility_avg = (
+        float(metrics.avg_qos)
+        - lambda_delay * float(metrics.avg_latency_ms) / max(d_max_ms, 1e-6)
+        - lambda_energy * float(metrics.avg_energy_joule) / max(e_max_joule, 1e-9)
+    )
+    actual_utility_t = actual_utility_avg * env.num_users
+
     # 即时遗憾 = 最优 - 实际（非负值）
     instant_regret = max(0.0, optimal_reward_t - actual_reward_t)
-    # 即时奖励 = 实际获得的总 reward
+    instant_utility_regret = max(0.0, optimal_utility_t - actual_utility_t)
+
+    # 即时奖励 = 实际获得的总 reward/utility
     instant_reward = actual_reward_t
+    instant_utility = actual_utility_t
 
     cumulative_regret = (histories['cumulative_regret_history'][-1]
                          if histories['cumulative_regret_history'] else 0.0) + instant_regret
     cumulative_reward = (histories['cumulative_reward_history'][-1]
                           if histories['cumulative_reward_history'] else 0.0) + instant_reward
+    cumulative_utility_regret = (
+        histories['cumulative_utility_regret_history'][-1]
+        if histories['cumulative_utility_regret_history'] else 0.0
+    ) + instant_utility_regret
+    cumulative_utility = (
+        histories['cumulative_utility_history'][-1]
+        if histories['cumulative_utility_history'] else 0.0
+    ) + instant_utility
 
     histories['instant_regret_history'].append(instant_regret)
     histories['instant_reward_history'].append(instant_reward)
     histories['cumulative_regret_history'].append(cumulative_regret)
     histories['cumulative_reward_history'].append(cumulative_reward)
+    histories['instant_utility_regret_history'].append(instant_utility_regret)
+    histories['instant_utility_history'].append(instant_utility)
+    histories['cumulative_utility_regret_history'].append(cumulative_utility_regret)
+    histories['cumulative_utility_history'].append(cumulative_utility)
 
 
 
@@ -1067,6 +1101,10 @@ class Method1_FixedBaseline:
         self.instant_reward_history: List[float] = []
         self.cumulative_regret_history: List[float] = []
         self.cumulative_reward_history: List[float] = []
+        self.instant_utility_regret_history: List[float] = []
+        self.instant_utility_history: List[float] = []
+        self.cumulative_utility_regret_history: List[float] = []
+        self.cumulative_utility_history: List[float] = []
 
         self.lambda_delay = lambda_delay
 
@@ -1130,8 +1168,16 @@ class Method1_FixedBaseline:
                     'instant_regret_history': self.instant_regret_history,
                     'instant_reward_history': self.instant_reward_history,
                     'cumulative_regret_history': self.cumulative_regret_history,
-                    'cumulative_reward_history': self.cumulative_reward_history
-                }
+                    'cumulative_reward_history': self.cumulative_reward_history,
+                    'instant_utility_regret_history': self.instant_utility_regret_history,
+                    'instant_utility_history': self.instant_utility_history,
+                    'cumulative_utility_regret_history': self.cumulative_utility_regret_history,
+                    'cumulative_utility_history': self.cumulative_utility_history,
+                },
+                lambda_delay=self.lambda_delay,
+                lambda_energy=self.lambda_energy,
+                d_max_ms=self.d_max_ms,
+                e_max_joule=self.e_max_joule,
             )
 
             self.latency_tracker.add_timestep(current_metrics.avg_qos, latency_with_overhead)
@@ -1191,6 +1237,14 @@ class Method1_FixedBaseline:
             'cumulative_regret_history': self.cumulative_regret_history,
 
             'cumulative_reward_history': self.cumulative_reward_history,
+
+            'instant_utility_regret_history': self.instant_utility_regret_history,
+
+            'instant_utility_history': self.instant_utility_history,
+
+            'cumulative_utility_regret_history': self.cumulative_utility_regret_history,
+
+            'cumulative_utility_history': self.cumulative_utility_history,
 
             'convergence_timestep': -1  # 不适用
 
@@ -1394,6 +1448,10 @@ class Method2_LLMInitAsyncBlackbox:
         self.instant_reward_history: List[float] = []
         self.cumulative_regret_history: List[float] = []
         self.cumulative_reward_history: List[float] = []
+        self.instant_utility_regret_history: List[float] = []
+        self.instant_utility_history: List[float] = []
+        self.cumulative_utility_regret_history: List[float] = []
+        self.cumulative_utility_history: List[float] = []
 
         
 
@@ -1860,8 +1918,16 @@ class Method2_LLMInitAsyncBlackbox:
                     'instant_regret_history': self.instant_regret_history,
                     'instant_reward_history': self.instant_reward_history,
                     'cumulative_regret_history': self.cumulative_regret_history,
-                    'cumulative_reward_history': self.cumulative_reward_history
-                }
+                    'cumulative_reward_history': self.cumulative_reward_history,
+                    'instant_utility_regret_history': self.instant_utility_regret_history,
+                    'instant_utility_history': self.instant_utility_history,
+                    'cumulative_utility_regret_history': self.cumulative_utility_regret_history,
+                    'cumulative_utility_history': self.cumulative_utility_history,
+                },
+                lambda_delay=self.lambda_delay,
+                lambda_energy=self.lambda_energy,
+                d_max_ms=self.d_max_ms,
+                e_max_joule=self.e_max_joule,
             )
 
 
@@ -2081,7 +2147,15 @@ class Method2_LLMInitAsyncBlackbox:
 
             'cumulative_regret_history': self.cumulative_regret_history,
 
-            'cumulative_reward_history': self.cumulative_reward_history
+            'cumulative_reward_history': self.cumulative_reward_history,
+
+            'instant_utility_regret_history': self.instant_utility_regret_history,
+
+            'instant_utility_history': self.instant_utility_history,
+
+            'cumulative_utility_regret_history': self.cumulative_utility_regret_history,
+
+            'cumulative_utility_history': self.cumulative_utility_history
 
         }
 
@@ -2675,8 +2749,16 @@ class Method3_PeriodicLLMHybrid:
                     'instant_regret_history': self.instant_regret_history,
                     'instant_reward_history': self.instant_reward_history,
                     'cumulative_regret_history': self.cumulative_regret_history,
-                    'cumulative_reward_history': self.cumulative_reward_history
-                }
+                    'cumulative_reward_history': self.cumulative_reward_history,
+                    'instant_utility_regret_history': self.instant_utility_regret_history,
+                    'instant_utility_history': self.instant_utility_history,
+                    'cumulative_utility_regret_history': self.cumulative_utility_regret_history,
+                    'cumulative_utility_history': self.cumulative_utility_history,
+                },
+                lambda_delay=self.lambda_delay,
+                lambda_energy=self.lambda_energy,
+                d_max_ms=self.d_max_ms,
+                e_max_joule=self.e_max_joule,
             )
 
 
@@ -3008,7 +3090,11 @@ class Method3_PeriodicLLMHybrid:
             'instant_regret_history': self.instant_regret_history,
             'instant_reward_history': self.instant_reward_history,
             'cumulative_regret_history': self.cumulative_regret_history,
-            'cumulative_reward_history': self.cumulative_reward_history
+            'cumulative_reward_history': self.cumulative_reward_history,
+            'instant_utility_regret_history': self.instant_utility_regret_history,
+            'instant_utility_history': self.instant_utility_history,
+            'cumulative_utility_regret_history': self.cumulative_utility_regret_history,
+            'cumulative_utility_history': self.cumulative_utility_history
 
         }
 
@@ -3220,6 +3306,10 @@ class Method4_DistributedCollaborative:
         self.instant_reward_history: List[float] = []
         self.cumulative_regret_history: List[float] = []
         self.cumulative_reward_history: List[float] = []
+        self.instant_utility_regret_history: List[float] = []
+        self.instant_utility_history: List[float] = []
+        self.cumulative_utility_regret_history: List[float] = []
+        self.cumulative_utility_history: List[float] = []
 
 
 
@@ -3447,13 +3537,30 @@ class Method4_DistributedCollaborative:
             update_regret_reward_histories(
                 self.env,
                 t,
-                type('M', (), {'objective_total': objective_total})(),
+                type(
+                    'M',
+                    (),
+                    {
+                        'objective_total': objective_total,
+                        'avg_qos': avg_qos_t,
+                        'avg_latency_ms': avg_latency_t,
+                        'avg_energy_joule': avg_energy_t,
+                    },
+                )(),
                 {
                     'instant_regret_history': self.instant_regret_history,
                     'instant_reward_history': self.instant_reward_history,
                     'cumulative_regret_history': self.cumulative_regret_history,
-                    'cumulative_reward_history': self.cumulative_reward_history
-                }
+                    'cumulative_reward_history': self.cumulative_reward_history,
+                    'instant_utility_regret_history': self.instant_utility_regret_history,
+                    'instant_utility_history': self.instant_utility_history,
+                    'cumulative_utility_regret_history': self.cumulative_utility_regret_history,
+                    'cumulative_utility_history': self.cumulative_utility_history,
+                },
+                lambda_delay=self.lambda_delay,
+                lambda_energy=self.lambda_energy,
+                d_max_ms=self.d_max_ms,
+                e_max_joule=self.e_max_joule,
             )
 
             extra_latency = 0.0
@@ -3586,7 +3693,15 @@ class Method4_DistributedCollaborative:
             'instant_regret_history': self.instant_regret_history,
             'instant_reward_history': self.instant_reward_history,
             'cumulative_regret_history': self.cumulative_regret_history,
-            'cumulative_reward_history': self.cumulative_reward_history
+            'cumulative_reward_history': self.cumulative_reward_history,
+
+            'instant_utility_regret_history': self.instant_utility_regret_history,
+
+            'instant_utility_history': self.instant_utility_history,
+
+            'cumulative_utility_regret_history': self.cumulative_utility_regret_history,
+
+            'cumulative_utility_history': self.cumulative_utility_history
 
         }
 
@@ -3856,13 +3971,30 @@ class Method5_DistributedLLM(Method4_DistributedCollaborative):
             update_regret_reward_histories(
                 self.env,
                 t,
-                type('M', (), {'objective_total': objective_total})(),
+                type(
+                    'M',
+                    (),
+                    {
+                        'objective_total': objective_total,
+                        'avg_qos': avg_qos_t,
+                        'avg_latency_ms': avg_latency_t,
+                        'avg_energy_joule': avg_energy_t,
+                    },
+                )(),
                 {
                     'instant_regret_history': self.instant_regret_history,
                     'instant_reward_history': self.instant_reward_history,
                     'cumulative_regret_history': self.cumulative_regret_history,
                     'cumulative_reward_history': self.cumulative_reward_history,
+                    'instant_utility_regret_history': self.instant_utility_regret_history,
+                    'instant_utility_history': self.instant_utility_history,
+                    'cumulative_utility_regret_history': self.cumulative_utility_regret_history,
+                    'cumulative_utility_history': self.cumulative_utility_history,
                 },
+                lambda_delay=self.lambda_delay,
+                lambda_energy=self.lambda_energy,
+                d_max_ms=self.d_max_ms,
+                e_max_joule=self.e_max_joule,
             )
 
             extra_latency = 0.0
