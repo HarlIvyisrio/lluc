@@ -4115,6 +4115,7 @@ def save_comparison_plots(all_results: Dict[str, List[dict]], save_dir: str = 'f
         ('objective_score_history', 'Objective total', 'objective_total_timeseries.png'),
         ('cumulative_regret_history', 'Cumulative regret', 'cumulative_regret_timeseries.png'),
         ('cumulative_reward_history', 'Cumulative reward', 'cumulative_reward_timeseries.png'),
+        ('cumulative_utility_regret_history', 'Cumulative utility regret', 'cumulative_utility_regret_timeseries.png'),
     ]
 
     model_tag = f" ({default_llm_model})" if default_llm_model else ""
