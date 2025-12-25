@@ -377,7 +377,11 @@ class EnhancedMTUCBBaseline:
         
         # 公平性指标（Jain's fairness index）
         qos_values = [r['qos'] for r in qos_results]
-        fairness_index = (sum(qos_values) ** 2) / (len(qos_values) * sum(q ** 2 for q in qos_values))
+        sum_sq = sum(q ** 2 for q in qos_values)
+        if sum_sq > 1e-10:
+            fairness_index = (sum(qos_values) ** 2) / (len(qos_values) * sum_sq)
+        else:
+            fairness_index = 0.0
         
         # 资源效率
         resource_efficiency = avg_qos / max(np.mean(worker_load), 0.1)
