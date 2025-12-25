@@ -2109,7 +2109,7 @@ class Method3_PeriodicLLMHybrid:
 
     1. 定期调用LLM（每 llm_period 个时隙）获取参数建议
 
-    # LLM??????
+    # LLM模型列表
     llm_models: List[str] = field(default_factory=lambda: ["qwen3:8b", "phi3:mini", "deepseek-r1:8b"])
 
     2. LLM建议作为初始点，启动黑盒微调
@@ -3987,7 +3987,7 @@ class ExperimentConfig:
 
     llm_period: int = 30  # LLM调用周期
 
-    # LLM??????
+    # LLM模型列表
     llm_models: List[str] = field(default_factory=lambda: ["qwen3:8b", "phi3:mini", "deepseek-r1:8b"])
 
     
