@@ -237,7 +237,7 @@ class EnhancedMTUCBBaseline:
     
     def calculate_enhanced_qos(self, t: int, user: int, worker: int, path: int,
                              worker_load: int) -> Dict[str, float]:
-        """?????QoS??????????????LLM?????"""
+        """综合网络路径质量、用户兼容度、负载影响与语义/功耗效率，结合LLM语义评分计算增强型QoS及相关指标"""
         path_info = self.get_enhanced_path_quality(t, worker, path)
         compatibility = self.compatibility_matrix[user, worker]
 
