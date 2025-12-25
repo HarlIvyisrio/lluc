@@ -53,7 +53,7 @@ class EnhancedNetworkMetrics:
     avg_energy_joule: float
 
     # 网络状态指标
-    path_congestion: List[float]
+    path_congestion: List[float]            # 实际表示工作节点的拥塞/负载情况
     worker_load: List[float]
     switching_rate: float
 
