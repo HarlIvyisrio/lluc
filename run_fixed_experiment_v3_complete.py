@@ -3880,9 +3880,12 @@ class Method5_DistributedLLM(Method4_DistributedCollaborative):
 
                 agg_bundle = self._aggregate_with_llm(t)
                 self._update_local_parameters(agg_bundle)
-                if agg_bundle.get("source") == "llm" and self.llm_quality_history:
-                    self.env.llm_quality_factor = self.llm_quality_history[-1]
-                elif agg_bundle.get("source") != "llm":
+                if agg_bundle.get("source") == "llm":
+                    if self.llm_quality_history:
+                        self.env.llm_quality_factor = self.llm_quality_history[-1]
+                    else:
+                        self.env.llm_quality_factor = 0.7
+                else:
                     self.env.llm_quality_factor = 1.0
 
                 if INCLUDE_OPT_OVERHEAD_IN_LATENCY:
