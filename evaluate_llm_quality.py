@@ -10,7 +10,7 @@ LLM模型质量离线评估脚本 (改进版)
 
 import json
 import numpy as np
-import random
+import hashlib
 from typing import Dict, List, Tuple
 from dataclasses import dataclass
 
@@ -90,9 +90,9 @@ SCENARIOS = [
 ]
 
 
-def set_seed(seed: int):
-    np.random.seed(seed)
-    random.seed(seed)
+def stable_hash(s: str) -> int:
+    """确定性哈希函数，避免跨运行/版本差异"""
+    return int(hashlib.md5(s.encode()).hexdigest(), 16) % (10**9)
 
 
 def fit_beta_from_stats(mean: float, std: float, max_sum: float = 15.0) -> Tuple[float, float]:
@@ -203,16 +203,25 @@ def call_llm_params(model_name: str, scenario: EvaluationScenario, env) -> Dict[
 
 
 def simulate_short(env, T: int, lambda_delay: float, lambda_energy: float, d_max: float, e_max: float) -> float:
-    """短窗口仿真，返回平均QoS"""
-    qos_list = []
+    """
+    短窗口仿真，返回平均多目标效用：
+    U = QoS - λ_d * (delay / d_max) - λ_e * (energy / e_max)
+
+    与主实验 objective_score 计算保持一致，确保离线评估与在线目标对齐。
+    """
+    utilities = []
     for t in range(T):
         metrics = run_mtucb_step(env, t, lambda_delay, lambda_energy, d_max, e_max)
-        qos_list.append(metrics.avg_qos)
-    return float(np.mean(qos_list)) if qos_list else 0.0
+
+        norm_delay = metrics.avg_latency_ms / max(1e-6, d_max)
+        norm_energy = metrics.avg_energy_joule / max(1e-6, e_max)
+        u_t = metrics.avg_qos - lambda_delay * norm_delay - lambda_energy * norm_energy
+        utilities.append(u_t)
+
+    return float(np.mean(utilities)) if utilities else 0.0
 
 
 def main():
-    set_seed(42)
     latency_model = LatencyModel()
     cfg = SCQoSConfig.default()
 
@@ -238,7 +247,7 @@ def main():
         )
         
         for i in tqdm(range(SAMPLES_PER_SCENARIO), desc=f"  评估 {scenario.name}"):
-            seed = 10000 + hash(scenario.name) % 10000 + i
+            seed = 10000 + stable_hash(scenario.name) % 10000 + i
             
             for model in MODELS:
                 # 创建环境并调用LLM

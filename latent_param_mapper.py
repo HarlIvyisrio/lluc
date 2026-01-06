@@ -17,7 +17,31 @@ params = [alpha, zeta, omega, compression_ratio, power_ratio, min_phi]
 import numpy as np
 from typing import Dict, Tuple, List, Optional
 from dataclasses import dataclass
-from sc_qos_optimizer import SCQoSConfig
+
+try:
+    from sc_qos_optimizer import SCQoSConfig
+except ImportError:
+    @dataclass
+    class SCQoSConfig:  # type: ignore
+        alpha: float = 0.6
+        zeta: float = 0.25
+        omega: float = 0.15
+        compression_ratio: float = 0.7
+        power_ratio: float = 0.5
+        min_phi: float = 0.6
+
+        alpha_bounds: Tuple[float, float] = (0.3, 0.9)
+        zeta_bounds: Tuple[float, float] = (0.1, 0.5)
+        omega_bounds: Tuple[float, float] = (0.05, 0.3)
+        compression_bounds: Tuple[float, float] = (0.5, 0.95)
+        power_bounds: Tuple[float, float] = (0.3, 0.8)
+        min_phi_bounds: Tuple[float, float] = (0.4, 0.9)
+        z_bounds: Tuple[float, float] = (-2.0, 2.0)
+        latent_dim: int = 5
+
+        @classmethod
+        def default(cls):
+            return cls()
 
 
 @dataclass
@@ -119,8 +143,18 @@ class LatentParamMapper:
         self.mapping_history.append((z.copy(), params))
         return params
     
-    def params_to_latent(self, params: SCQoSConfig) -> np.ndarray:
-        """将 MTUCB 参数反向映射到 latent vector"""
+    def params_to_latent(self, params) -> np.ndarray:
+        """
+        将 MTUCB 参数反向映射到 latent vector
+
+        Args:
+            params: SCQoSConfig对象或包含参数的dict/动态对象
+        """
+        def get_param(name: str, default: float) -> float:
+            if isinstance(params, dict):
+                return float(params.get(name, default))
+            return float(getattr(params, name, default))
+
         def inverse_sigmoid(y):
             y = np.clip(y, 1e-7, 1 - 1e-7)
             return np.log(y / (1 - y))
@@ -128,26 +162,33 @@ class LatentParamMapper:
         def inverse_tanh(y):
             y = np.clip(y, -1 + 1e-7, 1 - 1e-7)
             return 0.5 * np.log((1 + y) / (1 - y))
+
+        alpha = get_param('alpha', 0.6)
+        zeta = get_param('zeta', 0.25)
+        omega = get_param('omega', 0.15)
+        compression_ratio = get_param('compression_ratio', 0.7)
+        power_ratio = get_param('power_ratio', 0.5)
+        min_phi = get_param('min_phi', 0.6)
         
-        alpha_normalized = (params.alpha - self.config.alpha_bounds[0]) / (
+        alpha_normalized = (alpha - self.config.alpha_bounds[0]) / (
             self.config.alpha_bounds[1] - self.config.alpha_bounds[0]
         )
         z1 = inverse_sigmoid(alpha_normalized)
         
-        zeta_normalized = (params.zeta - self.config.zeta_bounds[0]) / (
+        zeta_normalized = (zeta - self.config.zeta_bounds[0]) / (
             self.config.zeta_bounds[1] - self.config.zeta_bounds[0]
         )
         z2 = inverse_sigmoid(zeta_normalized)
         
-        omega_normalized = (params.omega - self.config.omega_bounds[0]) / (
+        omega_normalized = (omega - self.config.omega_bounds[0]) / (
             self.config.omega_bounds[1] - self.config.omega_bounds[0]
         )
         z3 = inverse_sigmoid(omega_normalized)
         
-        compression_normalized = (params.compression_ratio - self.config.compression_bounds[0]) / (
+        compression_normalized = (compression_ratio - self.config.compression_bounds[0]) / (
             self.config.compression_bounds[1] - self.config.compression_bounds[0]
         )
-        power_normalized = (params.power_ratio - self.config.power_bounds[0]) / (
+        power_normalized = (power_ratio - self.config.power_bounds[0]) / (
             self.config.power_bounds[1] - self.config.power_bounds[0]
         )
         
@@ -155,7 +196,7 @@ class LatentParamMapper:
         resource_mode = np.clip(resource_mode, -1, 1)
         z4 = inverse_tanh(resource_mode)
         
-        min_phi_normalized = (params.min_phi - self.config.min_phi_bounds[0]) / (
+        min_phi_normalized = (min_phi - self.config.min_phi_bounds[0]) / (
             self.config.min_phi_bounds[1] - self.config.min_phi_bounds[0]
         )
         z5 = inverse_sigmoid(min_phi_normalized)

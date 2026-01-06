@@ -20,15 +20,71 @@ from tqdm import tqdm
 from dataclasses import dataclass, asdict
 import pandas as pd
 
-# 导入原有模块
-from ollama_integration import OllamaLLM
-from llm_suggest import NetworkMetrics, LLMSuggestion
-from sc_qos_optimizer import SCQoSOptimizer, SCQoSConfig
-from llm_qos_evaluator import LLMQoSEvaluator
+# 导入原有模块（缺失时提供占位符以便运行基线代码）
+try:
+    from ollama_integration import OllamaLLM
+except ImportError:
+    class OllamaLLM:  # type: ignore
+        def __init__(self, *args, **kwargs):
+            raise ImportError("ollama_integration module not found. Install it to use LLM features.")
 
-# 设置随机种子
-np.random.seed(42)
-random.seed(42)
+try:
+    from llm_suggest import NetworkMetrics, LLMSuggestion
+except ImportError:
+    class NetworkMetrics:  # type: ignore
+        def __init__(self, *args, **kwargs):
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+
+    class LLMSuggestion:  # type: ignore
+        def __init__(self, **kwargs):
+            self.confidence = kwargs.get('confidence', 0.0)
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+try:
+    from sc_qos_optimizer import SCQoSOptimizer, SCQoSConfig
+except ImportError:
+    @dataclass
+    class SCQoSConfig:  # type: ignore
+        alpha: float = 0.6
+        zeta: float = 0.25
+        omega: float = 0.15
+        compression_ratio: float = 0.7
+        power_ratio: float = 0.5
+        min_phi: float = 0.6
+
+        alpha_bounds: Tuple[float, float] = (0.3, 0.9)
+        zeta_bounds: Tuple[float, float] = (0.1, 0.5)
+        omega_bounds: Tuple[float, float] = (0.05, 0.3)
+        compression_bounds: Tuple[float, float] = (0.4, 0.9)
+        power_bounds: Tuple[float, float] = (0.2, 0.8)
+        min_phi_bounds: Tuple[float, float] = (0.3, 0.9)
+        z_bounds: Tuple[float, float] = (-2.0, 2.0)
+        latent_dim: int = 5
+
+        @classmethod
+        def default(cls):
+            return cls()
+
+    class SCQoSOptimizer:  # type: ignore
+        def __init__(self, config: SCQoSConfig):
+            self.config = config
+
+        def apply_llm_suggestion(self, suggestion: LLMSuggestion, *args, **kwargs):
+            for key in ['alpha', 'zeta', 'omega', 'compression_ratio', 'power_ratio', 'min_phi']:
+                if hasattr(suggestion, key):
+                    setattr(self.config, key, float(getattr(suggestion, key)))
+
+try:
+    from llm_qos_evaluator import LLMQoSEvaluator
+except ImportError:
+    class LLMQoSEvaluator:  # type: ignore
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def get_semantic_score(self, *args, **kwargs) -> float:
+            # Fallback when evaluator module is absent
+            return 0.0
 
 # 设置matplotlib支持中文
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial Unicode MS', 'DejaVu Sans']
@@ -237,7 +293,10 @@ class EnhancedMTUCBBaseline:
     
     def calculate_enhanced_qos(self, t: int, user: int, worker: int, path: int,
                              worker_load: int) -> Dict[str, float]:
-        """?????QoS??????????????LLM?????"""
+        """
+        计算增强QoS，整合多维度语义通信指标
+        包含：路径质量、语义压缩效率、功率效率、LLM语义评分
+        """
         path_info = self.get_enhanced_path_quality(t, worker, path)
         compatibility = self.compatibility_matrix[user, worker]
 
@@ -246,7 +305,7 @@ class EnhancedMTUCBBaseline:
             + (1 - self.config.alpha) * compatibility
         )
 
-        # ????????????????????????????
+
         capacity = max(1, self.worker_capacity_profile[worker])
         raw_ratio = worker_load / capacity
         load_ratio = float(np.clip(raw_ratio, 0.2, 4.0))
@@ -280,7 +339,14 @@ class EnhancedMTUCBBaseline:
             bandwidth_mbps=float(path_info.get('bandwidth', 0.0)),
             latency_ms=float(latency_ms),
         )
-        combined_qos = self.qos_weight * enhanced_qos + self.semantic_weight * semantic_score
+
+        # 根据LLM质量动态调整语义权重，质量越高越信任LLM评估
+        quality_factor = getattr(self, 'llm_quality_factor', 1.0)
+        dynamic_semantic_weight = self.semantic_weight * (0.5 + 0.5 * quality_factor)
+        dynamic_semantic_weight = float(np.clip(dynamic_semantic_weight, 0.05, 0.6))
+        dynamic_qos_weight = 1.0 - dynamic_semantic_weight
+
+        combined_qos = dynamic_qos_weight * enhanced_qos + dynamic_semantic_weight * semantic_score
 
         effective_qos = combined_qos * np.exp(-latency_ms / max(1.0, self.reference_latency_ms))
 
@@ -338,15 +404,18 @@ class EnhancedMTUCBBaseline:
         latency_variance = np.var([r['latency'] for r in qos_results])
         bandwidth_utilization = np.mean([r['bandwidth'] for r in qos_results]) / 200  # 归一化
         
-        # 路径拥塞和工人负载
-        path_congestion = []
+        # 注意：这里计算的是worker拥塞度而非路径拥塞
+        # 为兼容 EnhancedNetworkMetrics 的字段命名，path_congestion 实际存储 worker 负载占比
+        worker_congestion = []
         worker_load = []
         for w in range(self.num_workers):
             worker_matches = sum(1 for _, worker, _ in matching if worker == w)
             capacity = max(1, self.worker_capacity_profile[w])
             congestion = worker_matches / capacity
-            path_congestion.append(congestion)
+            worker_congestion.append(congestion)
             worker_load.append(congestion)
+
+        path_congestion = worker_congestion
         
         # 切换率
         switches = 0
@@ -377,7 +446,11 @@ class EnhancedMTUCBBaseline:
         
         # 公平性指标（Jain's fairness index）
         qos_values = [r['qos'] for r in qos_results]
-        fairness_index = (sum(qos_values) ** 2) / (len(qos_values) * sum(q ** 2 for q in qos_values))
+        sum_sq = sum(q ** 2 for q in qos_values)
+        if sum_sq > 1e-10:
+            fairness_index = (sum(qos_values) ** 2) / (len(qos_values) * sum_sq)
+        else:
+            fairness_index = 1.0  # 所有值为0时认为完全公平
         
         # 资源效率
         resource_efficiency = avg_qos / max(np.mean(worker_load), 0.1)
@@ -450,6 +523,58 @@ class EnhancedMTUCBBaseline:
             best_total_qos += best_qos_for_user
 
         return float(best_total_qos)
+
+    def compute_optimal_utility_for_timestep(
+        self,
+        t: int,
+        lambda_delay: float,
+        lambda_energy: float,
+        d_max_ms: float,
+        e_max_joule: float,
+    ) -> float:
+        """
+        计算时隙 t 的贪心最优多目标效用上界（用于多目标遗憾值基准）
+
+        U* = max_{matching} Σ_u [ QoS_u - λ_d*(delay_u/d_max) - λ_e*(energy_u/e_max) ]
+
+        采用贪心策略：在容量约束下为每个用户选择使效用最大化的(worker, path)组合
+        """
+        best_total_utility = 0.0
+        worker_loads = {w: 0 for w in range(self.num_workers)}
+
+        for u in range(self.num_users):
+            best_utility_for_user = float('-inf')
+            best_worker = None
+
+            for w in range(self.num_workers):
+                capacity = max(1, self.worker_capacity_profile[w])
+                if worker_loads[w] >= capacity:
+                    continue
+
+                for p in range(self.num_paths):
+                    qos_result = self.calculate_enhanced_qos(t, u, w, p, worker_loads[w])
+                    if isinstance(qos_result, dict):
+                        qos_val = qos_result.get('qos', 0.0)
+                        latency_val = qos_result.get('latency', 0.0)
+                        energy_val = qos_result.get('energy_joule', 0.0)
+                    else:
+                        qos_val = float(qos_result)
+                        latency_val = 0.0
+                        energy_val = 0.0
+
+                    norm_delay = latency_val / max(1e-6, d_max_ms)
+                    norm_energy = energy_val / max(1e-6, e_max_joule)
+                    utility = qos_val - lambda_delay * norm_delay - lambda_energy * norm_energy
+
+                    if utility > best_utility_for_user:
+                        best_utility_for_user = utility
+                        best_worker = w
+
+            if best_worker is not None and best_utility_for_user > float('-inf'):
+                worker_loads[best_worker] += 1
+                best_total_utility += best_utility_for_user
+
+        return float(best_total_utility)
 
     def _get_default_metrics(self, t: int) -> EnhancedNetworkMetrics:
         """获取默认指标（当没有匹配时）"""
@@ -677,7 +802,8 @@ class EnhancedMTUCBWithOllama(EnhancedMTUCBBaseline):
                 matching_with_paths.append((u, w, path))
                 qos_results.append(qos_result)
                 
-                self.R[u, w, path] += qos_result['qos']
+                # 统一使用 objective_score 作为奖励累积，保持与基类一致
+                self.R[u, w, path] += qos_result['objective_score']
                 self.S[u, w, path] += 1
                 
                 self.historical_matches[u].append((t, w))
@@ -690,8 +816,13 @@ class EnhancedMTUCBWithOllama(EnhancedMTUCBBaseline):
             
             # 记录基础历史
             self.qos_history.append(current_metrics.avg_qos)
+            self.effective_qos_history.append(current_metrics.avg_effective_qos)
+            self.objective_score_history.append(current_metrics.avg_objective_score)
+            self.latency_history_ms.append(current_metrics.avg_latency_ms)
+            self.energy_history_joule.append(current_metrics.avg_energy_joule)
             self.semantic_accuracy_history.append(current_metrics.semantic_accuracy)
             self.semantic_rate_history.append(current_metrics.semantic_rate)
+            self.llm_semantic_score_history.append(current_metrics.llm_semantic_score)
             
             # 记录新增指标
             self.compression_efficiency_history.append(current_metrics.semantic_compression_efficiency)
@@ -1264,21 +1395,21 @@ def main():
         llm_model="tinyllama", llm_period=llm_period
     )
     llm_enhanced.run_simulation(T)
-    print("✅ LLM增强算法完成")
+    print(" LLM增强算法完成")
     
     # 生成全面的可视化分析
-    print("\n📊 生成全面性能分析图表...")
+    print("\n 生成全面性能分析图表...")
     
-    print("   📈 创建综合对比图...")
+    print("    创建综合对比图...")
     create_comprehensive_comparison_plots(baseline, llm_enhanced)
     
-    print("   🎯 创建雷达图对比...")
+    print("    创建雷达图对比...")
     create_radar_chart_comparison(baseline, llm_enhanced)
     
-    print("   🔥 创建热力图分析...")
+    print("    创建热力图分析...")
     create_heatmap_analysis(baseline, llm_enhanced)
     
-    print("   ⚡ 创建优化效果分析...")
+    print("    创建优化效果分析...")
     create_optimization_effectiveness_plot(llm_enhanced)
     
     # 打印详细统计结果

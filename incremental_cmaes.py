@@ -39,9 +39,8 @@ class IncrementalCMAES:
         self.config = config
         self.dim = config.dim
         
-        # 设置随机种子
+        # 仅使用局部随机状态，避免污染全局
         if seed is not None:
-            np.random.seed(seed)
             self.rng = np.random.RandomState(seed)
         else:
             self.rng = np.random.RandomState()
@@ -440,5 +439,4 @@ if __name__ == "__main__":
     print(f"最佳解: {best_x}")
     print(f"最佳适应度: {best_f:.8f}")
     print(f"总迭代数: {cmaes.iteration}")
-
 

@@ -906,40 +906,73 @@ def update_regret_reward_histories(
     env: EnhancedMTUCBBaseline,
     t: int,
     metrics: EnhancedNetworkMetrics,
-    histories: Dict[str, List[float]]
+    histories: Dict[str, List[float]],
+    lambda_delay: float = 0.5,
+    lambda_energy: float = 0.5,
+    d_max_ms: float = 500.0,
+    e_max_joule: float = 1.0,
 ) -> None:
     """
     更新遗憾值/奖励序列（即时与累积）
-    
-    计算口径说明：
-    - optimal_qos_t: 时隙t的贪心最优总QoS（所有用户之和），来自compute_optimal_qos_for_timestep
-    - actual_qos_t: 时隙t的实际总QoS（avg_qos × num_users）
-    - instant_regret: optimal_qos_t - actual_qos_t（非负，表示与最优的差距）
-    - instant_reward: actual_qos_t（实际获得的总奖励）
-    
-    注意：metrics.avg_qos 必须是原始值，不能被任何multiplier打折，
-    否则regret会人为偏高。（参见run_mtucb_step中的设计说明）
+
+    同时计算两种 regret：
+    1. QoS Regret：与传统 MTUCB 文献对齐
+    2. Multi-objective Regret：反映 QoS-Delay-Energy 综合性能
     """
-    # 获取理论最优总QoS（贪心策略，容量约束下每个用户选最优工人-路径）
     optimal_qos_t = env.compute_optimal_qos_for_timestep(t)
-    
-    # 计算实际总QoS（平均QoS × 用户数）
     actual_qos_t = metrics.avg_qos * env.num_users
+    instant_qos_regret = max(0.0, optimal_qos_t - actual_qos_t)
 
-    # 即时遗憾 = 最优 - 实际（非负值）
-    instant_regret = optimal_qos_t - actual_qos_t
-    # 即时奖励 = 实际获得的总QoS
+    cumulative_qos_regret = (histories['cumulative_regret_history'][-1]
+                             if histories['cumulative_regret_history'] else 0.0) + instant_qos_regret
+
+    optimal_utility_t = env.compute_optimal_utility_for_timestep(
+        t, lambda_delay, lambda_energy, d_max_ms, e_max_joule
+    )
+    norm_delay = metrics.avg_latency_ms / max(1e-6, d_max_ms)
+    norm_energy = metrics.avg_energy_joule / max(1e-6, e_max_joule)
+    actual_utility_t = (metrics.avg_qos - lambda_delay * norm_delay - lambda_energy * norm_energy) * env.num_users
+    instant_utility_regret = max(0.0, optimal_utility_t - actual_utility_t)
+
+    prev_cum_util_regret = histories.get('cumulative_utility_regret_history', [])
+    cumulative_utility_regret = (prev_cum_util_regret[-1] if prev_cum_util_regret else 0.0) + instant_utility_regret
+
     instant_reward = actual_qos_t
-
-    cumulative_regret = (histories['cumulative_regret_history'][-1]
-                         if histories['cumulative_regret_history'] else 0.0) + instant_regret
     cumulative_reward = (histories['cumulative_reward_history'][-1]
                           if histories['cumulative_reward_history'] else 0.0) + instant_reward
 
-    histories['instant_regret_history'].append(instant_regret)
+    histories['instant_regret_history'].append(instant_qos_regret)
     histories['instant_reward_history'].append(instant_reward)
-    histories['cumulative_regret_history'].append(cumulative_regret)
+    histories['cumulative_regret_history'].append(cumulative_qos_regret)
     histories['cumulative_reward_history'].append(cumulative_reward)
+
+    if 'instant_utility_regret_history' not in histories:
+        histories['instant_utility_regret_history'] = []
+    if 'cumulative_utility_regret_history' not in histories:
+        histories['cumulative_utility_regret_history'] = []
+
+    histories['instant_utility_regret_history'].append(instant_utility_regret)
+    histories['cumulative_utility_regret_history'].append(cumulative_utility_regret)
+
+
+def apply_params_to_env(env: EnhancedMTUCBBaseline, params) -> None:
+    """
+    安全地将参数应用到环境配置，兼容 dict 与 dataclass/对象
+    """
+    param_keys = ['alpha', 'zeta', 'omega', 'compression_ratio', 'power_ratio', 'min_phi']
+
+    try:
+        _ = params.alpha  # 触发 AttributeError 如果不存在属性
+        for k in param_keys:
+            if hasattr(params, k) and hasattr(env.config, k):
+                setattr(env.config, k, float(getattr(params, k)))
+    except AttributeError:
+        if isinstance(params, dict):
+            for k in param_keys:
+                if k in params and hasattr(env.config, k):
+                    setattr(env.config, k, float(params[k]))
+        else:
+            raise TypeError(f"params must be dict or dataclass, got {type(params)}")
 
 
 
@@ -1020,6 +1053,8 @@ class Method1_FixedBaseline:
         self.instant_reward_history: List[float] = []
         self.cumulative_regret_history: List[float] = []
         self.cumulative_reward_history: List[float] = []
+        self.instant_utility_regret_history: List[float] = []
+        self.cumulative_utility_regret_history: List[float] = []
 
         self.lambda_delay = lambda_delay
 
@@ -1078,8 +1113,14 @@ class Method1_FixedBaseline:
                     'instant_regret_history': self.instant_regret_history,
                     'instant_reward_history': self.instant_reward_history,
                     'cumulative_regret_history': self.cumulative_regret_history,
-                    'cumulative_reward_history': self.cumulative_reward_history
-                }
+                    'cumulative_reward_history': self.cumulative_reward_history,
+                    'instant_utility_regret_history': self.instant_utility_regret_history,
+                    'cumulative_utility_regret_history': self.cumulative_utility_regret_history,
+                },
+                lambda_delay=self.lambda_delay,
+                lambda_energy=self.lambda_energy,
+                d_max_ms=self.d_max_ms,
+                e_max_joule=self.e_max_joule,
             )
 
             self.latency_tracker.add_timestep(current_metrics.avg_qos, current_metrics.avg_latency_ms)
@@ -1135,6 +1176,10 @@ class Method1_FixedBaseline:
             'cumulative_regret_history': self.cumulative_regret_history,
 
             'cumulative_reward_history': self.cumulative_reward_history,
+
+            'instant_utility_regret_history': self.instant_utility_regret_history,
+
+            'cumulative_utility_regret_history': self.cumulative_utility_regret_history,
 
             'convergence_timestep': -1  # 不适用
 
@@ -1335,8 +1380,12 @@ class Method2_LLMInitAsyncBlackbox:
         self.instant_reward_history: List[float] = []
         self.cumulative_regret_history: List[float] = []
         self.cumulative_reward_history: List[float] = []
+        self.instant_utility_regret_history: List[float] = []
+        self.cumulative_utility_regret_history: List[float] = []
+        self.instant_utility_regret_history: List[float] = []
+        self.cumulative_utility_regret_history: List[float] = []
 
-        
+
 
         # 收敛时隙
 
@@ -1355,42 +1404,6 @@ class Method2_LLMInitAsyncBlackbox:
         self._llm_initialize_params()
 
 
-
-    def _apply_params(self, params):
-
-        """安全应用参数，兼容dict与dataclass对象。"""
-
-        try:
-
-            # dataclass/object 直接赋值
-
-            _ = params.alpha
-
-            # 逐字段写入，避免替换引用
-
-            for k in ['alpha', 'zeta', 'omega', 'compression_ratio', 'power_ratio', 'min_phi']:
-
-                if hasattr(params, k) and hasattr(self.env.config, k):
-
-                    setattr(self.env.config, k, float(getattr(params, k)))
-
-        except AttributeError:
-
-            # dict 写入现有配置
-
-            if isinstance(params, dict):
-
-                for k in ['alpha', 'zeta', 'omega', 'compression_ratio', 'power_ratio', 'min_phi']:
-
-                    if k in params:
-
-                        setattr(self.env.config, k, float(params[k]))
-
-            else:
-
-                raise
-
-    
 
     def _llm_initialize_params(self):
 
@@ -1855,8 +1868,14 @@ class Method2_LLMInitAsyncBlackbox:
                     'instant_regret_history': self.instant_regret_history,
                     'instant_reward_history': self.instant_reward_history,
                     'cumulative_regret_history': self.cumulative_regret_history,
-                    'cumulative_reward_history': self.cumulative_reward_history
-                }
+                    'cumulative_reward_history': self.cumulative_reward_history,
+                    'instant_utility_regret_history': self.instant_utility_regret_history,
+                    'cumulative_utility_regret_history': self.cumulative_utility_regret_history,
+                },
+                lambda_delay=self.lambda_delay,
+                lambda_energy=self.lambda_energy,
+                d_max_ms=self.d_max_ms,
+                e_max_joule=self.e_max_joule,
             )
 
 
@@ -1901,11 +1920,11 @@ class Method2_LLMInitAsyncBlackbox:
 
                     best_objective_score = -best_f
 
-                    
+
 
                     # 应用最佳参数（兼容dict/dataclass）
 
-                    self._apply_params(best_params)
+                    apply_params_to_env(self.env, best_params)
 
                     
 
@@ -2063,8 +2082,10 @@ class Method2_LLMInitAsyncBlackbox:
             'cumulative_regret_history': self.cumulative_regret_history,
 
             'cumulative_reward_history': self.cumulative_reward_history,
-            'llm_quality_history': self.llm_quality_history,
-            'llm_avg_quality': float(np.mean(self.llm_quality_history)) if self.llm_quality_history else 0.0
+
+            'instant_utility_regret_history': self.instant_utility_regret_history,
+
+            'cumulative_utility_regret_history': self.cumulative_utility_regret_history
 
         }
 
@@ -2092,7 +2113,7 @@ class Method3_PeriodicLLMHybrid:
 
     1. 定期调用LLM（每 llm_period 个时隙）获取参数建议
 
-    # LLM??????
+    # LLM模型列表配置
     llm_models: List[str] = field(default_factory=lambda: ["qwen3:8b", "phi3:mini", "deepseek-r1:8b"])
 
     2. LLM建议作为初始点，启动黑盒微调
@@ -2281,6 +2302,8 @@ class Method3_PeriodicLLMHybrid:
         self.instant_reward_history: List[float] = []
         self.cumulative_regret_history: List[float] = []
         self.cumulative_reward_history: List[float] = []
+        self.instant_utility_regret_history: List[float] = []
+        self.cumulative_utility_regret_history: List[float] = []
 
         self.llm_guidance_history = []  # 记录LLM建议的参数
 
@@ -2315,36 +2338,6 @@ class Method3_PeriodicLLMHybrid:
         self.async_overlap_factor = 0.3
 
 
-
-    def _apply_params(self, params):
-
-        """安全应用参数，兼容dict与dataclass对象。"""
-
-        try:
-
-            _ = params.alpha
-
-            for k in ['alpha', 'zeta', 'omega', 'compression_ratio', 'power_ratio', 'min_phi']:
-
-                if hasattr(params, k) and hasattr(self.env.config, k):
-
-                    setattr(self.env.config, k, float(getattr(params, k)))
-
-        except AttributeError:
-
-            if isinstance(params, dict):
-
-                for k in ['alpha', 'zeta', 'omega', 'compression_ratio', 'power_ratio', 'min_phi']:
-
-                    if k in params:
-
-                        setattr(self.env.config, k, float(params[k]))
-
-            else:
-
-                raise
-
-    
 
     def _call_llm_for_guidance(self, t: int, current_metrics: dict) -> Optional[dict]:
 
@@ -2599,8 +2592,14 @@ class Method3_PeriodicLLMHybrid:
                     'instant_regret_history': self.instant_regret_history,
                     'instant_reward_history': self.instant_reward_history,
                     'cumulative_regret_history': self.cumulative_regret_history,
-                    'cumulative_reward_history': self.cumulative_reward_history
-                }
+                    'cumulative_reward_history': self.cumulative_reward_history,
+                    'instant_utility_regret_history': self.instant_utility_regret_history,
+                    'cumulative_utility_regret_history': self.cumulative_utility_regret_history,
+                },
+                lambda_delay=self.lambda_delay,
+                lambda_energy=self.lambda_energy,
+                d_max_ms=self.d_max_ms,
+                e_max_joule=self.e_max_joule,
             )
 
 
@@ -2773,7 +2772,7 @@ class Method3_PeriodicLLMHybrid:
 
                     # 统一的安全写入
 
-                    self._apply_params(best_params)
+                    apply_params_to_env(self.env, best_params)
 
                     print(f"   [t={t}] 黑盒微调完成: α={self.env.config.alpha:.3f}, ζ={self.env.config.zeta:.3f}, ω={self.env.config.omega:.3f}")
 
@@ -2921,7 +2920,9 @@ class Method3_PeriodicLLMHybrid:
             'instant_regret_history': self.instant_regret_history,
             'instant_reward_history': self.instant_reward_history,
             'cumulative_regret_history': self.cumulative_regret_history,
-            'cumulative_reward_history': self.cumulative_reward_history
+            'cumulative_reward_history': self.cumulative_reward_history,
+            'instant_utility_regret_history': self.instant_utility_regret_history,
+            'cumulative_utility_regret_history': self.cumulative_utility_regret_history
 
         }
 
@@ -3130,6 +3131,8 @@ class Method4_DistributedCollaborative:
         self.instant_reward_history: List[float] = []
         self.cumulative_regret_history: List[float] = []
         self.cumulative_reward_history: List[float] = []
+        self.instant_utility_regret_history: List[float] = []
+        self.cumulative_utility_regret_history: List[float] = []
 
 
 
@@ -3353,16 +3356,28 @@ class Method4_DistributedCollaborative:
 
             self.parameter_history['omega'].append(float(self.env.config.omega))
 
+            pseudo_metrics = type('M', (), {
+                'avg_qos': avg_qos_t,
+                'avg_latency_ms': avg_latency_t,
+                'avg_energy_joule': avg_energy_t,
+            })()
+
             update_regret_reward_histories(
                 self.env,
                 t,
-                type('M', (), {'avg_qos': avg_qos_t})(),
+                pseudo_metrics,
                 {
                     'instant_regret_history': self.instant_regret_history,
                     'instant_reward_history': self.instant_reward_history,
                     'cumulative_regret_history': self.cumulative_regret_history,
-                    'cumulative_reward_history': self.cumulative_reward_history
-                }
+                    'cumulative_reward_history': self.cumulative_reward_history,
+                    'instant_utility_regret_history': self.instant_utility_regret_history,
+                    'cumulative_utility_regret_history': self.cumulative_utility_regret_history,
+                },
+                lambda_delay=self.lambda_delay,
+                lambda_energy=self.lambda_energy,
+                d_max_ms=self.d_max_ms,
+                e_max_joule=self.e_max_joule,
             )
 
             extra_latency = 0.0
@@ -3485,7 +3500,9 @@ class Method4_DistributedCollaborative:
             'instant_regret_history': self.instant_regret_history,
             'instant_reward_history': self.instant_reward_history,
             'cumulative_regret_history': self.cumulative_regret_history,
-            'cumulative_reward_history': self.cumulative_reward_history
+            'cumulative_reward_history': self.cumulative_reward_history,
+            'instant_utility_regret_history': self.instant_utility_regret_history,
+            'cumulative_utility_regret_history': self.cumulative_utility_regret_history
 
         }
 
@@ -3564,7 +3581,7 @@ class Method5_DistributedLLM(Method4_DistributedCollaborative):
         except Exception:
             pass
 
-        nums = [float(x) for x in re.findall(r"([0-9]*\\.?[0-9]+)", raw)]
+        nums = [float(x) for x in re.findall(r"([0-9]*\.?[0-9]+)", raw)]
         if len(nums) >= 6:
             keys = ['alpha', 'zeta', 'omega', 'compression_ratio', 'power_ratio', 'min_phi']
             return {k: nums[i] for i, k in enumerate(keys)}
@@ -3764,16 +3781,28 @@ class Method5_DistributedLLM(Method4_DistributedCollaborative):
             self.parameter_history['zeta'].append(float(self.env.config.zeta))
             self.parameter_history['omega'].append(float(self.env.config.omega))
 
+            pseudo_metrics = type('M', (), {
+                'avg_qos': avg_qos_t,
+                'avg_latency_ms': avg_latency_t,
+                'avg_energy_joule': avg_energy_t,
+            })()
+
             update_regret_reward_histories(
                 self.env,
                 t,
-                type('M', (), {'avg_qos': avg_qos_t})(),
+                pseudo_metrics,
                 {
                     'instant_regret_history': self.instant_regret_history,
                     'instant_reward_history': self.instant_reward_history,
                     'cumulative_regret_history': self.cumulative_regret_history,
                     'cumulative_reward_history': self.cumulative_reward_history,
+                    'instant_utility_regret_history': self.instant_utility_regret_history,
+                    'cumulative_utility_regret_history': self.cumulative_utility_regret_history,
                 },
+                lambda_delay=self.lambda_delay,
+                lambda_energy=self.lambda_energy,
+                d_max_ms=self.d_max_ms,
+                e_max_joule=self.e_max_joule,
             )
 
             extra_latency = 0.0
@@ -3791,9 +3820,12 @@ class Method5_DistributedLLM(Method4_DistributedCollaborative):
 
                 agg_bundle = self._aggregate_with_llm(t)
                 self._update_local_parameters(agg_bundle)
-                if agg_bundle.get("source") == "llm" and self.llm_quality_history:
-                    self.env.llm_quality_factor = self.llm_quality_history[-1]
-                elif agg_bundle.get("source") != "llm":
+                if agg_bundle.get("source") == "llm":
+                    if self.llm_quality_history:
+                        self.env.llm_quality_factor = self.llm_quality_history[-1]
+                    else:
+                        self.env.llm_quality_factor = 0.7
+                else:
                     self.env.llm_quality_factor = 1.0
 
                 if INCLUDE_OPT_OVERHEAD_IN_LATENCY:
@@ -3889,7 +3921,7 @@ class ExperimentConfig:
 
     llm_period: int = 30  # LLM调用周期
 
-    # LLM??????
+    # LLM模型列表配置
     llm_models: List[str] = field(default_factory=lambda: ["qwen3:8b", "phi3:mini", "deepseek-r1:8b"])
 
     
@@ -3965,6 +3997,10 @@ def estimate_normalizers(env_factory: SeededEnvironmentFactory, initial_params: 
 
                 energy_samples.append(qos_result.get('energy_joule', 0.0))
 
+                score = qos_result.get('objective_score', qos_result.get('qos', 0.0))
+                env.R[u, safe_w, path] += score
+                env.S[u, safe_w, path] += 1
+
     d_max = float(np.percentile(lat_samples, 95)) if lat_samples else 500.0
 
     e_max = float(np.percentile(energy_samples, 95)) if energy_samples else 1.0
@@ -4017,6 +4053,8 @@ def save_comparison_plots(all_results: Dict[str, List[dict]], save_dir: str = 'f
         ('objective_score_history', 'Objective score', 'objective_score_timeseries.png'),
         ('cumulative_regret_history', 'Cumulative regret', 'cumulative_regret_timeseries.png'),
         ('cumulative_reward_history', 'Cumulative reward', 'cumulative_reward_timeseries.png'),
+        ('cumulative_utility_regret_history', 'Cumulative Multi-objective Regret', 'cumulative_utility_regret_timeseries.png'),
+        ('instant_utility_regret_history', 'Instant Multi-objective Regret', 'instant_utility_regret_timeseries.png'),
     ]
 
     model_tag = f" ({default_llm_model})" if default_llm_model else ""
@@ -4458,6 +4496,11 @@ def run_complete_experiment_with_statistics(config: ExperimentConfig):
         convergence_list = [r['convergence_timestep'] for r in results_list if r.get('convergence_timestep', -1) > 0]
         final_regret_list = [r['cumulative_regret_history'][-1] for r in results_list if r.get('cumulative_regret_history')]
         final_reward_list = [r['cumulative_reward_history'][-1] for r in results_list if r.get('cumulative_reward_history')]
+        final_utility_regret_list = [
+            r['cumulative_utility_regret_history'][-1]
+            for r in results_list
+            if r.get('cumulative_utility_regret_history')
+        ]
 
         qos_mean, qos_std, qos_ci = calc_stats(avg_qos_list)
         eff_qos_mean, eff_qos_std, eff_qos_ci = calc_stats(avg_effective_qos_list)
@@ -4468,6 +4511,9 @@ def run_complete_experiment_with_statistics(config: ExperimentConfig):
         avg_energy_mean, avg_energy_std, avg_energy_ci = calc_stats(avg_energy_list)
         regret_mean, regret_std, regret_ci = calc_stats(final_regret_list) if final_regret_list else (0.0, 0.0, 0.0)
         reward_mean, reward_std, reward_ci = calc_stats(final_reward_list) if final_reward_list else (0.0, 0.0, 0.0)
+        utility_regret_mean, utility_regret_std, utility_regret_ci = (
+            calc_stats(final_utility_regret_list) if final_utility_regret_list else (0.0, 0.0, 0.0)
+        )
         conv_mean, conv_std, conv_ci = (np.mean(convergence_list), np.std(convergence_list), 0) if convergence_list else (-1, 0, 0)
 
         method_name = results_list[0]['method_name'] if results_list else 'N/A'
@@ -4482,6 +4528,7 @@ def run_complete_experiment_with_statistics(config: ExperimentConfig):
             'avg_energy_joule': {'mean': avg_energy_mean, 'std': avg_energy_std, 'ci': avg_energy_ci},
             'final_cumulative_regret': {'mean': regret_mean, 'std': regret_std, 'ci': regret_ci},
             'final_cumulative_reward': {'mean': reward_mean, 'std': reward_std, 'ci': reward_ci},
+            'final_cumulative_utility_regret': {'mean': utility_regret_mean, 'std': utility_regret_std, 'ci': utility_regret_ci},
             'convergence_timestep': {'mean': conv_mean, 'std': conv_std},
             'raw_results': results_list
         }
@@ -4665,9 +4712,9 @@ if __name__ == "__main__":
 
         num_paths=4,
 
-        T=500,  # 快速测试用200，完整实验用500
+        T=200,  # 快速测试用200，完整实验用500
 
-        num_runs=2,  # 至少5次重复
+        num_runs=3,  # 至少5次重复
 
         seed_base=42,
 
